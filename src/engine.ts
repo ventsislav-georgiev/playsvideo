@@ -29,6 +29,12 @@ import {
   subtitleDataToWebVTT,
   type SubtitleExtractionProgress,
 } from './pipeline/subtitle.js';
+import {
+  seekSubtitleInMkv,
+  getMkvSeekingMetadata,
+  type SeekSubtitleOptions,
+  type SeekSubtitleResult,
+} from './pipeline/subtitle-seeking.js';
 import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import { isAbortableSource } from './pipeline/source-signal.js';
 import type {
@@ -36,6 +42,7 @@ import type {
   KeyframeIndex,
   PlannedSegment,
   SubtitleTrackInfo,
+  SubtitleCueEntry,
 } from './pipeline/types.js';
 import type { TranscodeWorkerSnapshot, TranscodeWorkerStateMessage } from './transcode-protocol.js';
 import type {
@@ -142,6 +149,29 @@ export interface ExternalSubtitleOptions {
   kind?: 'subtitles' | 'captions';
 }
 
+export interface SubtitleSeekingOptions {
+  /** Target time in seconds to seek to */
+  targetTimeSec: number;
+  /** Subtitle track index to seek within */
+  trackIndex: number;
+  /** Optional abort signal for cancellation */
+  signal?: AbortSignal;
+}
+
+export interface SubtitleSeekingResult {
+  /** Cues found in the preroll + target range */
+  cues: SubtitleCueEntry[];
+  /** Actual preroll start time (seconds) */
+  prerollStartSec: number;
+  /** Actual target time (seconds) */
+  targetTimeSec: number;
+  /** Number of cues scanned to find results */
+  cuesScanned: number;
+  /** Time spent seeking (milliseconds) */
+  elapsedMs: number;
+}
+
+
 export interface CodecDescriptor {
   short: string | null;
   full: string | null;
@@ -173,6 +203,9 @@ interface AttachedSubtitleTrack {
   element: HTMLTrackElement;
   url: string;
   source: 'embedded' | 'external';
+  trackIndex?: number;
+  /** For incremental cue tracks created via addTextTrack() */
+  textTrack?: TextTrack;
 }
 
 function normalizeErrorMessage(message: string): string {
@@ -251,11 +284,36 @@ export class PlaysVideoEngine extends EventTarget {
   private _sourceFfmpeg: FfmpegRunner | null = null;
   private _sourceTargetSegDuration = 4;
   private _sourceSegmentAbort: AbortController | null = null;
+  private _sourcePrefetchCache = new Map<number, ArrayBuffer>();
+  private _sourcePrefetchAbort: AbortController | null = null;
+  private _sourcePrefetchIndex: number | null = null;
   private _sourcePlaybackOptions: PlaybackOption[] | null = null;
   private _sourcePreferenceOrder: PlaybackMode[] | null = null;
   private _sourcePlaybackPolicy: PlaybackPolicy = 'auto';
   private _lastInternalErrorMessage: string | null = null;
   private _lastInternalErrorAt = 0;
+
+  private _onVideoPause = (): void => {
+    if (this.hls) {
+      this.hls.stopLoad();
+      mlog('video paused → hls.stopLoad');
+    }
+    this.worker?.postMessage({ type: 'pause' });
+    if (this._sourcePrefetchAbort) {
+      this._sourcePrefetchAbort.abort();
+      this._sourcePrefetchAbort = null;
+      this._sourcePrefetchIndex = null;
+      mlog('video paused → source prefetch aborted');
+    }
+  };
+
+  private _onVideoPlay = (): void => {
+    if (this.hls) {
+      this.hls.startLoad(-1);
+      mlog('video play → hls.startLoad');
+    }
+    this.worker?.postMessage({ type: 'resume' });
+  };
 
   get phase(): EnginePhase {
     return this._phase;
@@ -272,6 +330,18 @@ export class PlaysVideoEngine extends EventTarget {
   get subtitleTracks(): SubtitleTrackInfo[] {
     return this._subtitleTracks;
   }
+
+  requestSubtitleExtraction(trackIndex: number): boolean {
+    const track = this._subtitleTracks.find((t) => t.index === trackIndex);
+    if (!track || !this.worker) return false;
+    const alreadyExtracted = this.attachedSubtitleTracks.some(
+      (a) => a.source === 'embedded' && a.trackIndex === trackIndex,
+    );
+    if (alreadyExtracted) return false;
+    this.requestEmbeddedSubtitleTrack(track);
+    return true;
+  }
+
   get passthrough(): boolean {
     return this._passthrough;
   }
@@ -419,6 +489,10 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private reset(detail: LoadingDetail): void {
+    this.video.removeEventListener('pause', this._onVideoPause);
+    this.video.removeEventListener('play', this._onVideoPlay);
+    this.video.removeEventListener('seeked', this._onVideoSeeked);
+
     if (this.hls) {
       this.hls.destroy();
       this.hls = null;
@@ -464,6 +538,12 @@ export class PlaysVideoEngine extends EventTarget {
       this._sourceSegmentAbort.abort();
       this._sourceSegmentAbort = null;
     }
+    if (this._sourcePrefetchAbort) {
+      this._sourcePrefetchAbort.abort();
+      this._sourcePrefetchAbort = null;
+    }
+    this._sourcePrefetchCache.clear();
+    this._sourcePrefetchIndex = null;
     if (this._source && isAbortableSource(this._source)) {
       this._source.setCurrentSignal(null);
     }
@@ -543,7 +623,73 @@ export class PlaysVideoEngine extends EventTarget {
     this.dispatchWorkerStateChange();
   }
 
+  /**
+   * Seek to a specific time within a subtitle track.
+   * Only works for MKV files with Cues index.
+   */
+  async seekSubtitle(options: SubtitleSeekingOptions): Promise<SeekSubtitleResult | null> {
+    if (!this._sourceDemux) {
+      throw new Error('Load a video before seeking subtitles');
+    }
+
+    if (options.trackIndex < 0 || options.trackIndex >= this._subtitleTracks.length) {
+      throw new Error(`Subtitle track ${options.trackIndex} not found`);
+    }
+
+    try {
+      const result = await seekSubtitleInMkv(
+        this._sourceDemux.input,
+        options.trackIndex,
+        {
+          targetTimeSec: options.targetTimeSec,
+          signal: options.signal,
+        }
+      );
+      return result;
+    } catch (error) {
+      mlog(`Subtitle seeking failed: ${String(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get metadata about subtitle seeking capabilities for a track.
+   * Returns null if seeking is unavailable (non-MKV, no Cues, etc).
+   */
+  async getSubtitleSeekingMetadata(trackIndex: number): Promise<{
+    hasCuesIndex: boolean;
+    cueCount: number;
+    estimatedLatencyMs: number;
+  } | null> {
+    if (!this._sourceDemux) {
+      return null;
+    }
+
+    if (trackIndex < 0 || trackIndex >= this._subtitleTracks.length) {
+      return null;
+    }
+
+    try {
+      const metadata = await getMkvSeekingMetadata(this._sourceDemux.input);
+      if (!metadata) {
+        return null;
+      }
+
+      return {
+        hasCuesIndex: metadata.hasCuesIndex,
+        cueCount: metadata.cueCount,
+        estimatedLatencyMs: metadata.estimatedSeekLatencyMs,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   destroy(): void {
+    this.video.removeEventListener('pause', this._onVideoPause);
+    this.video.removeEventListener('play', this._onVideoPlay);
+    this.video.removeEventListener('seeked', this._onVideoSeeked);
+
     if (this.hls) {
       this.hls.destroy();
       this.hls = null;
@@ -566,6 +712,12 @@ export class PlaysVideoEngine extends EventTarget {
       this._sourceSegmentAbort.abort();
       this._sourceSegmentAbort = null;
     }
+    if (this._sourcePrefetchAbort) {
+      this._sourcePrefetchAbort.abort();
+      this._sourcePrefetchAbort = null;
+    }
+    this._sourcePrefetchCache.clear();
+    this._sourcePrefetchIndex = null;
     if (this._source && isAbortableSource(this._source)) {
       this._source.setCurrentSignal(null);
     }
@@ -923,13 +1075,10 @@ export class PlaysVideoEngine extends EventTarget {
 
         if (this._subtitleTracks.length > 0) {
           this.dispatchSubtitleStatus(
-            `Extracting ${this._subtitleTracks.length} subtitle track(s)...`,
+            `${this._subtitleTracks.length} subtitle track(s) available`,
           );
         } else {
           this.dispatchSubtitleStatus('No embedded subtitles');
-        }
-        for (const track of this._subtitleTracks) {
-          this.requestEmbeddedSubtitleTrack(track);
         }
       } else {
         const hlsEvaluation = evaluation.evaluations.find((entry) => entry.option.mode === 'hls');
@@ -986,16 +1135,13 @@ export class PlaysVideoEngine extends EventTarget {
         this.pendingInit = null;
       }
 
-      // Request subtitle extraction for all embedded tracks
+      // On-demand: advertise availability without extracting
       if (this._subtitleTracks.length > 0) {
         this.dispatchSubtitleStatus(
-          `Extracting ${this._subtitleTracks.length} subtitle track(s)...`,
+          `${this._subtitleTracks.length} subtitle track(s) available`,
         );
       } else {
         this.dispatchSubtitleStatus('No embedded subtitles');
-      }
-      for (const track of this._subtitleTracks) {
-        this.requestEmbeddedSubtitleTrack(track);
       }
 
       this.dispatchEvent(
@@ -1010,23 +1156,8 @@ export class PlaysVideoEngine extends EventTarget {
       );
 
       this.startHls();
-    } else if (msg.type === 'subtitle') {
-      mlog(`subtitle arrived track=${msg.trackIndex} codec=${msg.codec} len=${msg.webvtt?.length}`);
-      this.subtitleRequestTimes.delete(msg.trackIndex);
-      const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
-      const lang = info?.language ?? '?';
-      const cueMatch = msg.webvtt?.match(/\d\d:\d\d/g);
-      const cueCount = cueMatch ? Math.floor(cueMatch.length / 2) : 0;
-      this.dispatchSubtitleStatus(
-        `Subtitle track ${msg.trackIndex}: ${lang} ${msg.codec} ${cueCount} cues, ${msg.webvtt?.length ?? 0} bytes`,
-      );
-      this.addSubtitleTrack({
-        webvtt: msg.webvtt,
-        source: 'embedded',
-        trackIndex: msg.trackIndex,
-        defaultTrack: this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex),
-        selectTrack: this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex),
-      });
+    } else if (msg.type === 'subtitle-batch') {
+      this.handleSubtitleBatch(msg);
     } else if (msg.type === 'subtitle-progress') {
       this.handleWorkerSubtitleProgress(msg);
     } else if (msg.type === 'segment-state') {
@@ -1277,7 +1408,24 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private async requestSourceSegment(index: number): Promise<ArrayBuffer> {
-    // Cancel previous in-flight segment if any
+    for (const key of this._sourcePrefetchCache.keys()) {
+      if (key < index) this._sourcePrefetchCache.delete(key);
+    }
+
+    const cached = this._sourcePrefetchCache.get(index);
+    if (cached) {
+      this._sourcePrefetchCache.delete(index);
+      this.prefetchNextSourceSegment(index);
+      return cached;
+    }
+
+    // Cache miss — abort in-flight prefetch so the source is free for on-demand use
+    if (this._sourcePrefetchAbort) {
+      this._sourcePrefetchAbort.abort();
+      this._sourcePrefetchAbort = null;
+      this._sourcePrefetchIndex = null;
+    }
+
     if (this._sourceSegmentAbort) {
       this._sourceSegmentAbort.abort();
     }
@@ -1285,7 +1433,6 @@ export class PlaysVideoEngine extends EventTarget {
     const controller = new AbortController();
     this._sourceSegmentAbort = controller;
 
-    // Set signal on source for abort-aware Sources (e.g. TorrentSource)
     if (this._source && isAbortableSource(this._source)) {
       this._source.setCurrentSignal(controller.signal);
     }
@@ -1298,15 +1445,66 @@ export class PlaysVideoEngine extends EventTarget {
 
     this._sourceSegmentAbort = null;
 
-    // Update mutable state
     if (!this._sourceInitSegment && result.initSegment) {
       this._sourceInitSegment = result.initSegment;
     }
 
-    return (result.mediaData.buffer as ArrayBuffer).slice(
+    const data = (result.mediaData.buffer as ArrayBuffer).slice(
       result.mediaData.byteOffset,
       result.mediaData.byteOffset + result.mediaData.byteLength,
     );
+
+    this.prefetchNextSourceSegment(index);
+
+    return data;
+  }
+
+  private prefetchNextSourceSegment(afterIndex: number): void {
+    const next = afterIndex + 1;
+    if (next >= this._totalSegments) return;
+    if (this.video.paused) return;
+    if (this._sourcePrefetchCache.has(next)) return;
+    if (this._sourcePrefetchIndex === next) return;
+
+    if (this._sourcePrefetchAbort) {
+      this._sourcePrefetchAbort.abort();
+    }
+
+    const controller = new AbortController();
+    this._sourcePrefetchAbort = controller;
+    this._sourcePrefetchIndex = next;
+
+    void (async () => {
+      try {
+        if (this._source && isAbortableSource(this._source)) {
+          this._source.setCurrentSignal(controller.signal);
+        }
+
+        const result = await processSegmentWithAbort(
+          this.makeSourceProcessorConfig(),
+          next,
+          controller.signal,
+        );
+
+        if (!this._sourceInitSegment && result.initSegment) {
+          this._sourceInitSegment = result.initSegment;
+        }
+
+        const buf = (result.mediaData.buffer as ArrayBuffer).slice(
+          result.mediaData.byteOffset,
+          result.mediaData.byteOffset + result.mediaData.byteLength,
+        );
+
+        this._sourcePrefetchCache.set(next, buf);
+      } catch {
+        // Aborted or failed — on-demand path handles it
+      } finally {
+        if (this._sourcePrefetchIndex === next) {
+          this._sourcePrefetchAbort = null;
+          this._sourcePrefetchIndex = null;
+        }
+      }
+    })();
   }
 
   private startHls(): void {
@@ -1453,6 +1651,7 @@ export class PlaysVideoEngine extends EventTarget {
           if (engine._source) {
             // Source mode: abort the in-flight main-thread processing
             engine._sourceSegmentAbort?.abort();
+            engine._sourcePrefetchAbort?.abort();
           } else {
             // Worker mode: cancel via worker message
             engine.cancelSegment(this.currentSegmentIndex);
@@ -1475,6 +1674,12 @@ export class PlaysVideoEngine extends EventTarget {
       pLoader: PipelinePlaylistLoader as any,
       fLoader: PipelineFragmentLoader as any,
       enableWorker: false,
+      maxBufferLength: 15,
+      maxMaxBufferLength: 30,
+      backBufferLength: 30,
+      maxBufferHole: 0.5,
+      nudgeOffset: 0.2,
+      nudgeMaxRetry: 5,
     });
 
     this.hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
@@ -1494,10 +1699,27 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
       mlog(`hls FRAG_BUFFERED sn=${data.frag.sn}`);
+      const sb = this.video.buffered;
+      const ranges: string[] = [];
+      for (let i = 0; i < sb.length; i++) {
+        ranges.push(`[${sb.start(i).toFixed(3)},${sb.end(i).toFixed(3)}]`);
+        if (i > 0) {
+          const gap = sb.start(i) - sb.end(i - 1);
+          if (gap > 0.01) ranges.push(`!!GAP=${gap.toFixed(3)}!!`);
+        }
+      }
+      mlog(`hls buffered ${ranges.join(' ')}`);
+      const q = this.video.getVideoPlaybackQuality?.();
+      if (q) {
+        mlog(`hls playback-quality total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames} t=${this.video.currentTime.toFixed(3)}`);
+      }
     });
 
     this.hls.on(Hls.Events.BUFFER_APPENDING, (_evt, data) => {
-      mlog(`hls BUFFER_APPENDING type=${data.type}`);
+      const bytes = data.data?.byteLength ?? 0;
+      mlog(
+        `hls BUFFER_APPENDING type=${data.type} sn=${data.frag.sn} bytes=${bytes}`,
+      );
     });
 
     this.hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -1521,6 +1743,128 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.hls.loadSource('/virtual/playlist.m3u8');
     this.hls.attachMedia(this.video);
+
+    this.video.addEventListener('pause', this._onVideoPause);
+    this.video.addEventListener('play', this._onVideoPlay);
+    this.video.addEventListener('seeked', this._onVideoSeeked);
+
+    for (const evt of ['waiting', 'stalled', 'playing'] as const) {
+      this.video.addEventListener(evt, () => {
+        const t = this.video.currentTime.toFixed(3);
+        const sb = this.video.buffered;
+        const bufEnd =
+          sb.length > 0 ? sb.end(sb.length - 1).toFixed(3) : 'none';
+        const ahead =
+          sb.length > 0
+            ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1)
+            : '?';
+        const q = this.video.getVideoPlaybackQuality?.();
+        const dropped = q ? q.droppedVideoFrames : '?';
+        mlog(
+          `video.${evt} t=${t} bufEnd=${bufEnd} ahead=${ahead}s dropped=${dropped} readyState=${this.video.readyState}`,
+        );
+      });
+    }
+
+    let lastFrameTime = performance.now();
+    const jankThreshold = 50;
+    const checkJank = () => {
+      if (this.video.paused && !this.video.seeking) {
+        lastFrameTime = performance.now();
+        requestAnimationFrame(checkJank);
+        return;
+      }
+      const now = performance.now();
+      const delta = now - lastFrameTime;
+      if (delta > jankThreshold) {
+        mlog(
+          `JANK ${delta.toFixed(0)}ms (threshold=${jankThreshold}ms) t=${this.video.currentTime.toFixed(3)}`,
+        );
+      }
+      lastFrameTime = now;
+      requestAnimationFrame(checkJank);
+    };
+    requestAnimationFrame(checkJank);
+
+    let prevDropped = 0;
+    const healthCheck = () => {
+      if (!this.hls || this.video.paused) return;
+      const q = this.video.getVideoPlaybackQuality?.();
+      if (q) {
+        const newDropped = q.droppedVideoFrames - prevDropped;
+        prevDropped = q.droppedVideoFrames;
+        const sb = this.video.buffered;
+        const ahead =
+          sb.length > 0
+            ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1)
+            : '?';
+        if (newDropped > 0) {
+          mlog(
+            `health-check dropped=${newDropped} total=${q.totalVideoFrames} ahead=${ahead}s t=${this.video.currentTime.toFixed(3)}`,
+          );
+        }
+      }
+    };
+    setInterval(healthCheck, 2000);
+  }
+
+  private handleSubtitleBatch(msg: {
+    trackIndex: number;
+    codec: string;
+    cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
+    done: boolean;
+    totalCues: number;
+  }): void {
+    let attached = this.attachedSubtitleTracks.find(
+      (a) => a.source === 'embedded' && a.trackIndex === msg.trackIndex,
+    );
+
+    if (!attached) {
+      const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
+      const kind: TextTrackKind = info?.disposition.hearingImpaired ? 'captions' : 'subtitles';
+      const lang = normalizeSubtitleLanguageCode(info?.language ?? 'und');
+      const label =
+        info?.name ??
+        languageLabel(info?.language ?? 'und', msg.trackIndex);
+      const textTrack = this.video.addTextTrack(kind, label, lang);
+      textTrack.mode = 'hidden';
+
+      const dummyTrack = document.createElement('track');
+      attached = { element: dummyTrack, url: '', source: 'embedded', trackIndex: msg.trackIndex, textTrack };
+      this.attachedSubtitleTracks.push(attached);
+
+      const autoSelect = this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex);
+      if (autoSelect) {
+        textTrack.mode = 'showing';
+        for (let i = 0; i < this.video.textTracks.length; i++) {
+          const t = this.video.textTracks[i];
+          if (t !== textTrack) t.mode = 'disabled';
+        }
+      }
+
+      mlog(`subtitle track ${msg.trackIndex} created incrementally kind=${kind} lang=${lang}`);
+    }
+
+    const tt = attached.textTrack;
+    if (!tt) return;
+
+    for (const cue of msg.cues) {
+      try {
+        const vttCue = new VTTCue(cue.startSec, cue.endSec, cue.text);
+        tt.addCue(vttCue);
+      } catch {
+      }
+    }
+
+    if (msg.done) {
+      this.subtitleRequestTimes.delete(msg.trackIndex);
+      const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
+      const lang = info?.language ?? '?';
+      this.dispatchSubtitleStatus(
+        `Subtitle track ${msg.trackIndex}: ${lang} ${msg.codec} ${msg.totalCues} cues (streamed)`,
+      );
+      mlog(`subtitle track ${msg.trackIndex} complete: ${msg.totalCues} cues`);
+    }
   }
 
   private addSubtitleTrack({
@@ -1561,7 +1905,7 @@ export class PlaysVideoEngine extends EventTarget {
       );
     track.default = defaultTrack;
     this.video.appendChild(track);
-    this.attachedSubtitleTracks.push({ element: track, url, source });
+    this.attachedSubtitleTracks.push({ element: track, url, source, trackIndex });
     if (selectTrack) {
       track.addEventListener('load', () => this.showTextTrack(track), { once: true });
       queueMicrotask(() => this.showTextTrack(track));
@@ -1587,17 +1931,46 @@ export class PlaysVideoEngine extends EventTarget {
         keep.push(attached);
         continue;
       }
-      attached.element.remove();
-      URL.revokeObjectURL(attached.url);
+      if (attached.textTrack) {
+        attached.textTrack.mode = 'disabled';
+        while (attached.textTrack.cues && attached.textTrack.cues.length > 0) {
+          attached.textTrack.removeCue(attached.textTrack.cues[0]);
+        }
+      } else {
+        attached.element.remove();
+        URL.revokeObjectURL(attached.url);
+      }
     }
     this.attachedSubtitleTracks = keep;
   }
 
-  private showTextTrack(track: HTMLTrackElement): void {
+  private restartEmbeddedSubtitlesFromPosition(seekTimeSec: number): void {
+    if (!this.worker) return;
+    const activeEmbedded = this.attachedSubtitleTracks.filter(
+      (a) => a.source === 'embedded' && a.textTrack && a.textTrack.mode !== 'disabled',
+    );
+    if (activeEmbedded.length === 0) return;
+
+    for (const attached of activeEmbedded) {
+      const tt = attached.textTrack!;
+      while (tt.cues && tt.cues.length > 0) {
+        tt.removeCue(tt.cues[0]);
+      }
+      const trackIndex = attached.trackIndex;
+      if (trackIndex == null) continue;
+      const info = this._subtitleTracks.find((t) => t.index === trackIndex);
+      if (info) {
+        this.requestEmbeddedSubtitleTrack(info, seekTimeSec);
+      }
+    }
+  }
+
+  private showTextTrack(track: HTMLTrackElement | TextTrack): void {
     for (let i = 0; i < this.video.textTracks.length; i++) {
       this.video.textTracks[i].mode = 'disabled';
     }
-    track.track.mode = 'showing';
+    const tt = track instanceof HTMLTrackElement ? track.track : track;
+    tt.mode = 'showing';
   }
 
   private dispatchSubtitleStatus(message: string): void {
@@ -1711,7 +2084,8 @@ export class PlaysVideoEngine extends EventTarget {
       this.attachedSubtitleTracks.find((attached) => attached.element.default) ??
       this.attachedSubtitleTracks[0];
     if (!preferred) return;
-    queueMicrotask(() => this.showTextTrack(preferred.element));
+    const target = preferred.textTrack ?? preferred.element;
+    queueMicrotask(() => this.showTextTrack(target));
   }
 
   private shouldAutoSelectEmbeddedSubtitle(trackIndex: number): boolean {
