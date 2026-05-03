@@ -1693,8 +1693,9 @@ export class PlaysVideoEngine extends EventTarget {
       maxMaxBufferLength: 30,
       backBufferLength: 30,
       maxBufferHole: 0.5,
-      nudgeOffset: 0.2,
-      nudgeMaxRetry: 5,
+      nudgeOffset: 0.1,
+      nudgeMaxRetry: 6,
+      highBufferWatchdogPeriod: 1,
     });
 
     this.hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
@@ -1780,6 +1781,50 @@ export class PlaysVideoEngine extends EventTarget {
         );
       });
     }
+
+    // Active stall recovery: detect when playhead is stuck in a buffer gap
+    // and nudge it forward to the next buffered range start.
+    let stallCheckTimer: ReturnType<typeof setInterval> | null = null;
+    let lastPlaybackTime = -1;
+    let stallCount = 0;
+    const STALL_CHECK_MS = 250;
+    const STALL_THRESHOLD = 3;
+
+    const startStallCheck = () => {
+      if (stallCheckTimer) return;
+      stallCheckTimer = setInterval(() => {
+        if (this.video.paused || this.video.seeking || this.video.ended) {
+          stallCount = 0;
+          return;
+        }
+        const ct = this.video.currentTime;
+        if (ct === lastPlaybackTime) {
+          stallCount++;
+          if (stallCount >= STALL_THRESHOLD) {
+            const sb = this.video.buffered;
+            for (let i = 0; i < sb.length; i++) {
+              if (ct < sb.start(i) && sb.start(i) - ct < 1) {
+                const target = sb.start(i) + 0.01;
+                mlog(`stall-recovery: nudge ${ct.toFixed(3)}->${target.toFixed(3)} (gap=${(sb.start(i) - ct).toFixed(3)})`);
+                this.video.currentTime = target;
+                stallCount = 0;
+                return;
+              }
+            }
+            stallCount = 0;
+          }
+        } else {
+          stallCount = 0;
+        }
+        lastPlaybackTime = ct;
+      }, STALL_CHECK_MS);
+    };
+
+    this.video.addEventListener('playing', startStallCheck);
+    this.video.addEventListener('pause', () => {
+      if (stallCheckTimer) { clearInterval(stallCheckTimer); stallCheckTimer = null; }
+      stallCount = 0;
+    });
 
     let lastFrameTime = performance.now();
     const jankThreshold = 50;

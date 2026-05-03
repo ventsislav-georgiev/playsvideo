@@ -124,9 +124,28 @@ export async function processSegmentWithAbort(
       const outEnd = outLast.timestamp + outLast.duration;
       const gapToSegEnd = endSec - outEnd;
       log(`seg ${index} out-audio sr=${transcoded.decoderConfig.sampleRate} frames=${audioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${gapToSegEnd.toFixed(4)}`);
+
     }
     if (!audioDecoderConfig || audioDecoderConfig.codec !== 'mp4a.40.2') {
       audioDecoderConfig = transcoded.decoderConfig;
+    }
+  }
+
+  // Stretch the last audio frame's duration to cover the segment boundary,
+  // mirroring the video stretch above. Without this, AAC frame quantization
+  // (1024/48000 ≈ 21.33ms steps) leaves a gap between segments that causes
+  // MSE buffer discontinuities and playback stalls.
+  if (audioPackets.length > 0) {
+    const lastAudio = audioPackets[audioPackets.length - 1];
+    const audioEnd = lastAudio.timestamp + lastAudio.duration;
+    const audioGap = endSec - audioEnd;
+    if (audioGap > 0) {
+      const stretchedDuration = endSec - lastAudio.timestamp;
+      audioPackets[audioPackets.length - 1] = new EncodedPacket(
+        lastAudio.data, lastAudio.type, lastAudio.timestamp, stretchedDuration,
+        lastAudio.sequenceNumber, lastAudio.byteLength, lastAudio.sideData,
+      );
+      log(`seg ${index} audio-stretch dur=${lastAudio.duration.toFixed(6)}->${stretchedDuration.toFixed(6)} gap=${audioGap.toFixed(6)}`);
     }
   }
 
