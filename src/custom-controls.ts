@@ -17,6 +17,15 @@ export interface CustomControlsOptions {
   container: HTMLElement;
   subtitleTracks?: SubtitleTrackMeta[];
   onSubtitleRequest?: (trackIndex: number) => void;
+  // Phase 2b: Subtitle seeking
+  onSubtitleSeek?: (trackIndex: number, targetTimeSec: number) => Promise<void>;
+  subtitleSeekingCapability?: {
+    trackIndex: number;
+    hasCuesIndex: boolean;
+    cueCount: number;
+    estimatedLatencyMs: number;
+  } | null;
+  subtitleSeekingStatus?: string;
 }
 
 export interface CustomControlsHandle {
@@ -62,6 +71,9 @@ const ICON = {
   ),
   pip: svg(
     '<path d="M19 11h-8v6h8v-6zm4 8V4.98C23 3.88 22.1 3 21 3H3c-1.1 0-2 .88-2 1.98V19c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2zm-2 .02H3V4.97h18v14.05z"/>',
+  ),
+  seek: svg(
+    '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/>'  ,
   ),
 };
 
@@ -274,6 +286,88 @@ const CONTROLS_CSS = `
 .pv-popup-item svg { width: 20px; height: 20px; flex-shrink: 0; }
 .pv-popup-label { flex: 1; }
 .pv-popup-value { color: rgba(255,255,255,0.5); font-size: 0.8rem; }
+/* Seeking modal */
+.pv-seeking-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2147483648;
+  opacity: 1;
+  transition: opacity 0.2s;
+}
+.pv-seeking-modal.pv-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+.pv-seeking-modal-content {
+  background: rgba(20,20,20,0.95);
+  border-radius: 12px;
+  padding: 1.5rem;
+  min-width: 300px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.8);
+}
+.pv-seeking-modal-header {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 1rem;
+}
+.pv-seeking-modal-body {
+  margin-bottom: 1rem;
+}
+.pv-seeking-input {
+  width: 100%;
+  padding: 0.6rem;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.05);
+  color: #fff;
+  font-size: 1rem;
+  box-sizing: border-box;
+  margin-bottom: 0.75rem;
+}
+.pv-seeking-input::placeholder {
+  color: rgba(255,255,255,0.4);
+}
+.pv-seeking-modal-status {
+  font-size: 0.85rem;
+  color: rgba(255,255,255,0.6);
+  min-height: 1.2rem;
+}
+.pv-seeking-modal-footer {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+.pv-seeking-modal-btn {
+  padding: 0.6rem 1.2rem;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.pv-seeking-modal-cancel {
+  background: rgba(255,255,255,0.1);
+  color: #fff;
+}
+.pv-seeking-modal-cancel:hover {
+  background: rgba(255,255,255,0.15);
+}
+.pv-seeking-modal-seek {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+}
+.pv-seeking-modal-seek:hover {
+  background: var(--accent-hover, #2563eb);
+}
+.pv-seeking-modal-seek:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 `;
 
 let styleInjected = false;
@@ -377,10 +471,30 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   overlay.append(tapTarget, center, bottom);
   container.appendChild(overlay);
 
+  // Seeking modal
+  const seekingModal = document.createElement('div');
+  seekingModal.className = 'pv-seeking-modal pv-hidden';
+  seekingModal.innerHTML = `
+    <div class="pv-seeking-modal-content">
+      <div class="pv-seeking-modal-header">Seek in Subtitles</div>
+      <div class="pv-seeking-modal-body">
+        <input type="text" class="pv-seeking-input" placeholder="MM:SS or seconds" />
+        <div class="pv-seeking-modal-status"></div>
+      </div>
+      <div class="pv-seeking-modal-footer">
+        <button class="pv-seeking-modal-btn pv-seeking-modal-cancel">Cancel</button>
+        <button class="pv-seeking-modal-btn pv-seeking-modal-seek">Seek</button>
+      </div>
+    </div>
+  `;
+  container.appendChild(seekingModal);
+
   // --- State ---
   let seeking = false;
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
   let activePopup: HTMLElement | null = null;
+  let seekingTrackIndex: number | null = null;
+  let seekingInputValue = '';
   const docPipSupported = typeof documentPictureInPicture !== 'undefined';
   const pipSupported = docPipSupported || document.pictureInPictureEnabled;
 
@@ -429,6 +543,79 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
     // When PiP window is closed (user clicks X or programmatic), restore
     pipWindow.addEventListener('pagehide', () => exitDocumentPip());
   }
+
+  // --- Seeking helpers ---
+  const seekingInput = seekingModal.querySelector('.pv-seeking-input') as HTMLInputElement;
+  const seekingStatus = seekingModal.querySelector('.pv-seeking-modal-status') as HTMLDivElement;
+  const seekingCancelBtn = seekingModal.querySelector('.pv-seeking-modal-cancel') as HTMLButtonElement;
+  const seekingSeekBtn = seekingModal.querySelector('.pv-seeking-modal-seek') as HTMLButtonElement;
+
+  function parseTimeInput(input: string): number | null {
+    const trimmed = input.trim();
+    if (!trimmed) return null;
+    
+    // Try parsing as MM:SS or HH:MM:SS
+    const parts = trimmed.split(':').map(p => parseInt(p, 10));
+    if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+      return parts[0] * 60 + parts[1];
+    }
+    if (parts.length === 3 && !isNaN(parts[0]) && !isNaN(parts[1]) && !isNaN(parts[2])) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    
+    // Try parsing as seconds
+    const seconds = parseFloat(trimmed);
+    if (!isNaN(seconds) && seconds >= 0) {
+      return seconds;
+    }
+    
+    return null;
+  }
+
+  function closeSeekingModal() {
+    seekingModal.classList.add('pv-hidden');
+    seekingTrackIndex = null;
+    seekingInputValue = '';
+  }
+
+  const onSeekingInput = (e: Event) => {
+    seekingInputValue = (e.target as HTMLInputElement).value;
+    seekingStatus.textContent = '';
+  };
+
+  const onSeekingSeek = async () => {
+    if (seekingTrackIndex === null) return;
+    
+    const targetTime = parseTimeInput(seekingInputValue);
+    if (targetTime === null) {
+      seekingStatus.textContent = 'Invalid time format. Use MM:SS or seconds.';
+      return;
+    }
+    
+    seekingSeekBtn.disabled = true;
+    seekingStatus.textContent = 'Seeking...';
+    
+    try {
+      await options.onSubtitleSeek!(seekingTrackIndex, targetTime);
+      seekingStatus.textContent = 'Seek complete!';
+      setTimeout(() => closeSeekingModal(), 500);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      seekingStatus.textContent = `Error: ${message}`;
+    } finally {
+      seekingSeekBtn.disabled = false;
+    }
+  };
+
+  const onSeekingCancel = () => closeSeekingModal();
+
+  seekingInput.addEventListener('input', onSeekingInput);
+  seekingInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') onSeekingSeek();
+    if (e.key === 'Escape') onSeekingCancel();
+  });
+  seekingSeekBtn.addEventListener('click', onSeekingSeek);
+  seekingCancelBtn.addEventListener('click', onSeekingCancel);
 
   // --- Popup helpers ---
   function closePopup() {
@@ -778,6 +965,25 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
         );
       }
 
+      // Subtitle seeking
+      if (options.onSubtitleSeek && options.subtitleSeekingCapability) {
+        items.push(
+          popupItem(
+            'Seek in subtitles',
+            false,
+            () => {
+              seekingTrackIndex = options.subtitleSeekingCapability!.trackIndex;
+              seekingInputValue = '';
+              seekingModal.classList.remove('pv-hidden');
+              seekingInput.focus();
+            },
+            ICON.seek,
+            undefined,
+            true,
+          ),
+        );
+      }
+
       // Playback speed
       const rate = video.playbackRate;
       items.push(
@@ -876,6 +1082,10 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       document.removeEventListener('mousedown', onDocMouseDown);
       container.removeEventListener('mousemove', onMouseMove);
+      seekingInput.removeEventListener('input', onSeekingInput);
+      seekingSeekBtn.removeEventListener('click', onSeekingSeek);
+      seekingCancelBtn.removeEventListener('click', onSeekingCancel);
+      seekingModal.remove();
       overlay.remove();
     },
     updateSubtitleTracks(tracks: SubtitleTrackMeta[]) {
