@@ -32,6 +32,20 @@ interface DiagnosticEvent {
   detail?: string;
 }
 
+// Phase 2a: Subtitle seeking capability types
+interface SubtitleSeekingCapability {
+  trackIndex: number;
+  hasCuesIndex: boolean;
+  cueCount: number;
+  estimatedLatencyMs: number;
+}
+
+interface SubtitleSeekingState {
+  capability: SubtitleSeekingCapability | null;
+  status: string;
+  isLoading: boolean;
+}
+
 interface UseEngineResult {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   status: string;
@@ -44,6 +58,11 @@ interface UseEngineResult {
   clearExternalSubtitles: () => void;
   copyDiagnostics: () => Promise<void>;
   diagnosticsStatus: string;
+  savePosition: (reason?: SaveReason) => Promise<void>;
+  // Phase 2a: Subtitle seeking capability
+  subtitleSeekingCapability: SubtitleSeekingCapability | null;
+  seekSubtitle: (trackIndex: number, targetTimeSec: number) => Promise<void>;
+  subtitleSeekingStatus: string;
 }
 
 function pushDiagnosticEvent(
@@ -74,6 +93,14 @@ function formatMediaError(error: MediaError | null): string | null {
     return null;
   }
   return `code=${error.code}${error.message ? ` message=${error.message}` : ''}`;
+}
+
+function formatTime(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 async function writeClipboard(text: string): Promise<void> {
@@ -128,6 +155,12 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     EMBEDDED_SUBTITLE_POLICY_KEY,
     'auto',
   );
+  // Phase 2a: Subtitle seeking state
+  const [subtitleSeekingState, setSubtitleSeekingState] = useState<SubtitleSeekingState>({
+    capability: null,
+    status: '',
+    isLoading: false,
+  });
 
   const savePosition = useCallback(async (reason: SaveReason = 'passive') => {
     const currentEntry = entryRef.current;
@@ -222,6 +255,7 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     segmentStatesRef.current = null;
     readyDetailRef.current = null;
     setDiagnosticsStatus('');
+    setSubtitleSeekingState({ capability: null, status: '', isLoading: false });
 
     const label = entry ? `${entry.name} (${entry.path})` : file!.name;
     pushDiagnosticEvent(diagnosticsRef, 'session:start', label);
@@ -240,7 +274,7 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
 
     engine.addEventListener('ready', ((e: CustomEvent) => {
       const mode = e.detail.passthrough ? 'direct playback' : `${e.detail.totalSegments} segments`;
-      setStatus(`Ready \u2014 ${mode}`);
+      setStatus(`Ready — ${mode}`);
       setPhase('ready');
       setHasEnded(false);
       readyDetailRef.current = e.detail;
@@ -261,6 +295,38 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
           );
         }
       }
+
+      // Phase 2a: Detect subtitle seeking capability when engine is ready
+      (async () => {
+        try {
+          const metadata = await engine.getSubtitleSeekingMetadata(0);
+          if (metadata) {
+            setSubtitleSeekingState({
+              capability: {
+                trackIndex: 0,
+                hasCuesIndex: metadata.hasCuesIndex,
+                cueCount: metadata.cueCount,
+                estimatedLatencyMs: metadata.estimatedLatencyMs,
+              },
+              status: `Subtitle seeking ready (${metadata.cueCount} cues)`,
+              isLoading: false,
+            });
+            pushDiagnosticEvent(
+              diagnosticsRef,
+              'subtitle:seeking-capability',
+              `hasCuesIndex=${metadata.hasCuesIndex} cueCount=${metadata.cueCount}`,
+            );
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          setSubtitleSeekingState((prev) => ({
+            ...prev,
+            status: `Seeking capability check failed: ${message}`,
+            isLoading: false,
+          }));
+          pushDiagnosticEvent(diagnosticsRef, 'subtitle:seeking-error', message);
+        }
+      })();
     }) as EventListener);
 
     engine.addEventListener('subtitle-status', ((e: CustomEvent) => {
@@ -485,6 +551,63 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     setSubtitleStatus('');
   }, []);
 
+  // Phase 2a: Subtitle seeking callback
+  const seekSubtitle = useCallback(async (trackIndex: number, targetTimeSec: number) => {
+    const engine = engineRef.current;
+    if (!engine) {
+      const error = 'Player is not ready';
+      setSubtitleSeekingState((prev) => ({
+        ...prev,
+        status: `Seeking error: ${error}`,
+      }));
+      throw new Error(error);
+    }
+
+    setSubtitleSeekingState((prev) => ({
+      ...prev,
+      isLoading: true,
+      status: `Seeking to ${formatTime(targetTimeSec)}...`,
+    }));
+
+    try {
+      const startMs = performance.now();
+      const result = await engine.seekSubtitle({
+        targetTimeSec,
+        trackIndex,
+      });
+      const elapsedMs = performance.now() - startMs;
+
+      if (result) {
+        setSubtitleSeekingState((prev) => ({
+          ...prev,
+          isLoading: false,
+          status: `Found ${result.cues.length} cues (${elapsedMs.toFixed(0)}ms)`,
+        }));
+        pushDiagnosticEvent(
+          diagnosticsRef,
+          'subtitle:seek-success',
+          `targetTime=${targetTimeSec} cuesFound=${result.cues.length} elapsedMs=${elapsedMs.toFixed(0)}`,
+        );
+      } else {
+        setSubtitleSeekingState((prev) => ({
+          ...prev,
+          isLoading: false,
+          status: 'No cues found at target time',
+        }));
+        pushDiagnosticEvent(diagnosticsRef, 'subtitle:seek-no-cues', `targetTime=${targetTimeSec}`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setSubtitleSeekingState((prev) => ({
+        ...prev,
+        isLoading: false,
+        status: `Seeking error: ${message}`,
+      }));
+      pushDiagnosticEvent(diagnosticsRef, 'subtitle:seek-error', message);
+      throw err;
+    }
+  }, []);
+
   return {
     videoRef,
     status,
@@ -498,5 +621,9 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     copyDiagnostics,
     diagnosticsStatus,
     savePosition,
+    // Phase 2a: Subtitle seeking capability
+    subtitleSeekingCapability: subtitleSeekingState.capability,
+    seekSubtitle,
+    subtitleSeekingStatus: subtitleSeekingState.status,
   };
 }
