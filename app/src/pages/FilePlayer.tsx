@@ -65,15 +65,35 @@ export function FilePlayer() {
     clearExternalSubtitles,
     copyDiagnostics,
     diagnosticsStatus,
+    // Phase 2c: Subtitle seeking
+    subtitleSeekingCapability,
+    seekSubtitle,
+    subtitleSeekingStatus,
   } = useEngine(file ? { kind: 'file', file } : null);
-  useCustomControls(videoRef, containerEl, controlsType === 'custom');
+    videoRef,
+    status,
+    phase,
+    subtitleStatus,
+    loadSubtitleFile,
+    clearExternalSubtitles,
+    copyDiagnostics,
+    diagnosticsStatus,
+  } = useEngine(file ? { kind: 'file', file } : null);
+  useCustomControls({
+    videoRef,
+    container: containerEl,
+    enabled: controlsType === 'custom',
+    // Phase 2c: Wire subtitle seeking
+    onSubtitleSeek: seekSubtitle,
+    subtitleSeekingCapability,
+    subtitleSeekingStatus,
+  });
   useFullscreen(videoRef, containerEl);
 
   return (
     <div className="player-page">
       <Link to="/" className="player-back">
         &larr; Back to Catalog
-      </Link>
       {!file && (
         <div className="empty-state">
           <p>Drop a video file here, or select one below.</p>

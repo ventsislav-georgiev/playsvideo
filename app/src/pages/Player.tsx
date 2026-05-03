@@ -154,7 +154,15 @@ export function Player() {
           }
         : null,
     );
-  useCustomControls(videoRef, containerEl, controlsType === 'custom');
+  useCustomControls({
+    videoRef,
+    container: containerEl,
+    enabled: controlsType === 'custom',
+    // Phase 2c: Wire subtitle seeking
+    onSubtitleSeek: seekSubtitle,
+    subtitleSeekingCapability,
+    subtitleSeekingStatus,
+  });
   useFullscreen(videoRef, containerEl);
 
   const { previousEpisode, nextEpisode } = useMemo(() => {
