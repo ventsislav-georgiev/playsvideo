@@ -27,6 +27,8 @@ export interface StreamSubtitleOptions {
   batchSize?: number;
   /** If set, start reading cues from this timestamp (seconds) using seek-based access. */
   startTimeSec?: number;
+  /** If set, stop reading once a cue's start time exceeds this value (seconds). Enables windowed loading. */
+  endTimeSec?: number;
 }
 
 /** Discover subtitle tracks from a demuxed input. Cheap — reads only metadata, no cue extraction. */
@@ -147,15 +149,14 @@ export async function extractSubtitleDataStreaming(
 
   reportProgress('starting', 0);
 
-  const cueIterator = track.getCues();
+  const cueIterator = options.startTimeSec != null
+    ? track.getCuesFrom(options.startTimeSec)
+    : track.getCues();
 
   let totalRead = 0;
   for await (const cue of cueIterator) {
-    // Skip cues before the requested start time if specified
-    if (options.startTimeSec != null && cue.timestamp < options.startTimeSec) {
-      continue;
-    }
     if (options.signal?.aborted) break;
+    if (options.endTimeSec != null && cue.timestamp > options.endTimeSec) break;
     pending.push(cue);
     totalRead++;
 

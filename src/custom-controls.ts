@@ -266,6 +266,8 @@ const CONTROLS_CSS = `
   margin-bottom: 0.5rem;
   box-shadow: 0 4px 12px rgba(0,0,0,0.6);
   z-index: 20;
+  max-height: 60vh;
+  overflow-y: auto;
 }
 .pv-popup-item {
   display: flex;

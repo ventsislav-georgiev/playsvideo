@@ -325,10 +325,10 @@ const segmentAbortControllers = new Map<number, AbortController>();
 let activeSegmentCount = 0;
 let subtitleInProgress = false;
 let subtitleAbort: AbortController | null = null;
-const subtitleQueue: Array<{ trackIndex: number; requestedAtMs?: number; seekTimeSec?: number }> = [];
+const subtitleQueue: Array<{ trackIndex: number; requestedAtMs?: number; seekTimeSec?: number; endTimeSec?: number }> = [];
 
-function enqueueSubtitle(trackIndex: number, requestedAtMs?: number, seekTimeSec?: number): void {
-  subtitleQueue.push({ trackIndex, requestedAtMs, seekTimeSec });
+function enqueueSubtitle(trackIndex: number, requestedAtMs?: number, seekTimeSec?: number, endTimeSec?: number): void {
+  subtitleQueue.push({ trackIndex, requestedAtMs, seekTimeSec, endTimeSec });
   void drainSubtitleQueue();
 }
 
@@ -341,7 +341,7 @@ async function drainSubtitleQueue(): Promise<void> {
   const queueDelayMs =
     typeof next.requestedAtMs === 'number' ? Math.max(0, Date.now() - next.requestedAtMs) : 0;
   try {
-    await handleSubtitle(next.trackIndex, queueDelayMs, next.seekTimeSec);
+    await handleSubtitle(next.trackIndex, queueDelayMs, next.seekTimeSec, next.endTimeSec);
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err) });
   } finally {
@@ -412,8 +412,8 @@ self.onmessage = (event: MessageEvent) => {
     prefetchAbort = new AbortController();
     wlog('recv resume — prefetch resumed');
   } else if (msg.type === 'subtitle') {
-    wlog(`recv subtitle trackIndex=${msg.trackIndex} seekTimeSec=${msg.seekTimeSec ?? 'none'}`);
-    enqueueSubtitle(msg.trackIndex, msg.requestedAtMs, msg.seekTimeSec);
+    wlog(`recv subtitle trackIndex=${msg.trackIndex} seekTimeSec=${msg.seekTimeSec ?? 'none'} endTimeSec=${msg.endTimeSec ?? 'none'}`);
+    enqueueSubtitle(msg.trackIndex, msg.requestedAtMs, msg.seekTimeSec, msg.endTimeSec);
   }
 };
 
@@ -743,7 +743,7 @@ function emitSubtitleProgress(
   self.postMessage(message);
 }
 
-async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?: number) {
+async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?: number, endTimeSec?: number) {
   if (!demux) {
     self.postMessage({ type: 'error', message: 'No file open' });
     return;
@@ -772,6 +772,7 @@ async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?
     },
     signal,
     startTimeSec: seekTimeSec,
+    endTimeSec,
   });
 
   subtitleAbort = null;
@@ -781,5 +782,5 @@ async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?
     return;
   }
 
-  wlog(`subtitle track=${trackIndex} streaming done codec=${codec} seekFrom=${seekTimeSec ?? 0} ${elapsed(t0)}`);
+  wlog(`subtitle track=${trackIndex} streaming done codec=${codec} seekFrom=${seekTimeSec ?? 0} endAt=${endTimeSec ?? 'end'} ${elapsed(t0)}`);
 }

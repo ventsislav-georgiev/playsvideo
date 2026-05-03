@@ -253,6 +253,8 @@ export class PlaysVideoEngine extends EventTarget {
   // Subtitle state
   private attachedSubtitleTracks: AttachedSubtitleTrack[] = [];
   private _subtitleTracks: SubtitleTrackInfo[] = [];
+  private subtitleWindowEnd = new Map<number, number>();
+  private subtitleWindowLoading = new Set<number>();
 
   // Public read-only state
   private _phase: EnginePhase = 'idle';
@@ -379,6 +381,7 @@ export class PlaysVideoEngine extends EventTarget {
       transcodeWorkers: options.transcodeWorkers ?? defaultTranscodeWorkerCount(),
       embeddedSubtitlePolicy: options.embeddedSubtitlePolicy ?? 'auto',
     };
+    this.video.addEventListener('timeupdate', () => this.checkSubtitlePrefetch());
   }
 
   loadFile(file: File, opts?: { keyframeIndex?: KeyframeIndex }): void {
@@ -522,6 +525,8 @@ export class PlaysVideoEngine extends EventTarget {
     this.pendingSegments.clear();
     this.segmentRequestTimes.clear();
     this.subtitleRequestTimes.clear();
+    this.subtitleWindowEnd.clear();
+    this.subtitleWindowLoading.clear();
     this.removeSubtitleTracks();
 
     this._phase = 'demuxing';
@@ -734,6 +739,8 @@ export class PlaysVideoEngine extends EventTarget {
     this.pendingSegments.clear();
     this.segmentRequestTimes.clear();
     this.subtitleRequestTimes.clear();
+    this.subtitleWindowEnd.clear();
+    this.subtitleWindowLoading.clear();
     this._phase = 'idle';
     this._passthrough = false;
     this._segmentStates.clear();
@@ -1213,6 +1220,8 @@ export class PlaysVideoEngine extends EventTarget {
       }
       this.pendingSegments.clear();
       this.subtitleRequestTimes.clear();
+      this.subtitleWindowEnd.clear();
+      this.subtitleWindowLoading.clear();
       if (this.pendingInit) {
         this.pendingInit.reject(new Error(msg.message));
         this.pendingInit = null;
@@ -1829,24 +1838,18 @@ export class PlaysVideoEngine extends EventTarget {
       const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
       const kind: TextTrackKind = info?.disposition.hearingImpaired ? 'captions' : 'subtitles';
       const lang = normalizeSubtitleLanguageCode(info?.language ?? 'und');
-      const label =
-        info?.name ??
-        languageLabel(info?.language ?? 'und', msg.trackIndex);
+      const label = languageLabel(info?.language ?? 'und', msg.trackIndex, info?.disposition);
       const textTrack = this.video.addTextTrack(kind, label, lang);
-      textTrack.mode = 'hidden';
+      // Always show newly created track — extraction only happens on explicit request
+      textTrack.mode = 'showing';
+      for (let i = 0; i < this.video.textTracks.length; i++) {
+        const t = this.video.textTracks[i];
+        if (t !== textTrack) t.mode = 'disabled';
+      }
 
       const dummyTrack = document.createElement('track');
       attached = { element: dummyTrack, url: '', source: 'embedded', trackIndex: msg.trackIndex, textTrack };
       this.attachedSubtitleTracks.push(attached);
-
-      const autoSelect = this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex);
-      if (autoSelect) {
-        textTrack.mode = 'showing';
-        for (let i = 0; i < this.video.textTracks.length; i++) {
-          const t = this.video.textTracks[i];
-          if (t !== textTrack) t.mode = 'disabled';
-        }
-      }
 
       mlog(`subtitle track ${msg.trackIndex} created incrementally kind=${kind} lang=${lang}`);
     }
@@ -1862,8 +1865,18 @@ export class PlaysVideoEngine extends EventTarget {
       }
     }
 
+    const lastCue = msg.cues[msg.cues.length - 1];
+    if (lastCue) {
+      const prev = this.subtitleWindowEnd.get(msg.trackIndex) ?? 0;
+      if (lastCue.endSec > prev) {
+        this.subtitleWindowEnd.set(msg.trackIndex, lastCue.endSec);
+      }
+    }
+
     if (msg.done) {
       this.subtitleRequestTimes.delete(msg.trackIndex);
+      this.subtitleWindowLoading.delete(msg.trackIndex);
+
       const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
       const lang = info?.language ?? '?';
       this.dispatchSubtitleStatus(
@@ -1904,10 +1917,10 @@ export class PlaysVideoEngine extends EventTarget {
     track.srclang = normalizeSubtitleLanguageCode(language ?? info?.language ?? 'und');
     track.label =
       label ??
-      info?.name ??
       languageLabel(
         info?.language ?? 'und',
         trackIndex ?? this.video.querySelectorAll('track').length,
+        info?.disposition,
       );
     track.default = defaultTrack;
     this.video.appendChild(track);
@@ -1957,6 +1970,9 @@ export class PlaysVideoEngine extends EventTarget {
     );
     if (activeEmbedded.length === 0) return;
 
+    this.subtitleWindowEnd.clear();
+    this.subtitleWindowLoading.clear();
+
     for (const attached of activeEmbedded) {
       const tt = attached.textTrack!;
       while (tt.cues && tt.cues.length > 0) {
@@ -1968,6 +1984,34 @@ export class PlaysVideoEngine extends EventTarget {
       if (info) {
         this.requestEmbeddedSubtitleTrack(info, seekTimeSec);
       }
+    }
+  }
+
+  private checkSubtitlePrefetch(): void {
+    if (!this.worker || this.subtitleWindowEnd.size === 0) return;
+    const currentTime = this.video.currentTime;
+    const SUBTITLE_WINDOW_SEC = 180;
+    const PREFETCH_AHEAD_SEC = 60;
+
+    for (const [trackIndex, windowEnd] of this.subtitleWindowEnd) {
+      if (this.subtitleWindowLoading.has(trackIndex)) continue;
+      if (currentTime + PREFETCH_AHEAD_SEC < windowEnd) continue;
+
+      const info = this._subtitleTracks.find((t) => t.index === trackIndex);
+      if (!info) continue;
+
+      const attached = this.attachedSubtitleTracks.find(
+        (a) => a.source === 'embedded' && a.trackIndex === trackIndex && a.textTrack?.mode !== 'disabled',
+      );
+      if (!attached) continue;
+
+      this.subtitleWindowLoading.add(trackIndex);
+      const startSec = windowEnd;
+      const endTimeSec = startSec + SUBTITLE_WINDOW_SEC;
+      const requestedAtMs = Date.now();
+      this.subtitleRequestTimes.set(trackIndex, requestedAtMs);
+      mlog(`subtitle prefetch track=${trackIndex} window=[${startSec},${endTimeSec}]`);
+      this.worker.postMessage({ type: 'subtitle', trackIndex, requestedAtMs, seekTimeSec: startSec, endTimeSec });
     }
   }
 
@@ -1985,13 +2029,17 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private requestEmbeddedSubtitleTrack(track: SubtitleTrackInfo, seekTimeSec?: number): void {
+    const SUBTITLE_WINDOW_SEC = 180;
+    const startSec = seekTimeSec ?? 0;
+    const endTimeSec = startSec + SUBTITLE_WINDOW_SEC;
     const requestedAtMs = Date.now();
     this.subtitleRequestTimes.set(track.index, requestedAtMs);
-    mlog(`requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec}`);
+    this.subtitleWindowLoading.add(track.index);
+    mlog(`requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec} window=[${startSec},${endTimeSec}]`);
     this.dispatchSubtitleStatus(
       `Subtitle track ${track.index}: ${track.language ?? '?'} ${track.codec} queued`,
     );
-    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestedAtMs, seekTimeSec });
+    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestedAtMs, seekTimeSec, endTimeSec });
   }
 
   private handleWorkerSubtitleProgress(msg: WorkerSubtitleProgressMessage): void {
@@ -2158,7 +2206,11 @@ function normalizeSubtitleLanguageCode(code: string): string {
   return iso639_2to1(code);
 }
 
-function languageLabel(langCode: string, trackIndex: number): string {
+function languageLabel(
+  langCode: string,
+  trackIndex: number,
+  disposition?: { hearingImpaired?: boolean; forced?: boolean },
+): string {
   const names: Record<string, string> = {
     eng: 'English',
     spa: 'Spanish',
@@ -2178,6 +2230,21 @@ function languageLabel(langCode: string, trackIndex: number): string {
     tur: 'Turkish',
     vie: 'Vietnamese',
     tha: 'Thai',
+    bul: 'Bulgarian',
+    ces: 'Czech',
+    dan: 'Danish',
+    fin: 'Finnish',
+    ell: 'Greek',
+    heb: 'Hebrew',
+    hun: 'Hungarian',
+    ind: 'Indonesian',
+    msa: 'Malay',
+    nor: 'Norwegian',
+    ron: 'Romanian',
+    ukr: 'Ukrainian',
   };
-  return names[langCode] ?? `Track ${trackIndex + 1}`;
+  let base = names[langCode] ?? `Track ${trackIndex + 1}`;
+  if (disposition?.hearingImpaired) base += ' (SDH)';
+  else if (disposition?.forced) base += ' (Forced)';
+  return base;
 }
