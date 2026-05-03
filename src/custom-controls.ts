@@ -6,13 +6,22 @@ declare global {
   var documentPictureInPicture: DocumentPictureInPicture | undefined;
 }
 
+export interface SubtitleTrackMeta {
+  index: number;
+  label: string;
+  language: string;
+}
+
 export interface CustomControlsOptions {
   video: HTMLVideoElement;
   container: HTMLElement;
+  subtitleTracks?: SubtitleTrackMeta[];
+  onSubtitleRequest?: (trackIndex: number) => void;
 }
 
 export interface CustomControlsHandle {
   destroy(): void;
+  updateSubtitleTracks(tracks: SubtitleTrackMeta[]): void;
 }
 
 const SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -293,7 +302,9 @@ function iconBtn(label: string, iconHtml: string, className = 'pv-btn'): HTMLBut
 }
 
 export function createCustomControls(options: CustomControlsOptions): CustomControlsHandle {
-  const { video, container } = options;
+  const { video, container, onSubtitleRequest } = options;
+  let subtitleMeta: SubtitleTrackMeta[] = options.subtitleTracks ?? [];
+  const extractedTracks = new Map<number, TextTrack>();
   injectStyles();
 
   // --- Build DOM ---
@@ -489,6 +500,17 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   }
 
   // --- Update functions ---
+  let knownDuration = 0;
+
+  function safeDuration(): number {
+    const d = video.duration;
+    if (d && Number.isFinite(d) && d > 0) {
+      knownDuration = d;
+      return d;
+    }
+    return knownDuration;
+  }
+
   function updatePlayBtn() {
     playBtn.innerHTML = video.paused ? ICON.play : ICON.pause;
   }
@@ -496,12 +518,12 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   function updateTime() {
     if (seeking) return;
     seekBar.value = String(video.currentTime);
-    timeDisplay.textContent = `${formatTime(video.currentTime)} / ${formatTime(video.duration || 0)}`;
+    timeDisplay.textContent = `${formatTime(video.currentTime)} / ${formatTime(safeDuration())}`;
     updateBuffered();
   }
 
   function updateDuration() {
-    seekBar.max = String(video.duration || 0);
+    seekBar.max = String(safeDuration());
     updateTime();
   }
 
@@ -511,7 +533,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   }
 
   function updateBuffered() {
-    const duration = video.duration;
+    const duration = safeDuration();
     if (!duration) {
       bufferedBar.style.width = '0';
       return;
@@ -553,8 +575,31 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   const onProgress = () => updateBuffered();
   video.addEventListener('progress', onProgress);
 
-  // Text track changes (for overflow menu state)
-  const onTrackChange = () => {}; // menu is rebuilt each open
+  // Text track changes — capture extracted tracks and auto-show pending requests
+  let pendingSubtitleIndex: number | null = null;
+  const onTrackChange = (e: Event) => {
+    const trackEvent = e as TrackEvent;
+    if (trackEvent.track) {
+      for (const meta of subtitleMeta) {
+        const lang = trackEvent.track.language;
+        const label = trackEvent.track.label;
+        if (
+          !extractedTracks.has(meta.index) &&
+          (lang === meta.language || label === meta.label)
+        ) {
+          extractedTracks.set(meta.index, trackEvent.track);
+          if (pendingSubtitleIndex === meta.index) {
+            for (let i = 0; i < video.textTracks.length; i++) {
+              video.textTracks[i].mode = 'disabled';
+            }
+            trackEvent.track.mode = 'showing';
+            pendingSubtitleIndex = null;
+          }
+          break;
+        }
+      }
+    }
+  };
   video.textTracks.addEventListener('addtrack', onTrackChange);
   video.textTracks.addEventListener('removetrack', onTrackChange);
 
@@ -604,7 +649,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   };
   const onSkipFwd = (e: MouseEvent) => {
     e.stopPropagation();
-    video.currentTime = Math.min(video.duration || 0, video.currentTime + 10);
+    video.currentTime = Math.min(safeDuration(), video.currentTime + 10);
   };
   skipBackBtn.addEventListener('click', onSkipBack);
   skipFwdBtn.addEventListener('click', onSkipFwd);
@@ -613,7 +658,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   const onSeekInput = () => {
     seeking = true;
     video.currentTime = Number(seekBar.value);
-    timeDisplay.textContent = `${formatTime(Number(seekBar.value))} / ${formatTime(video.duration || 0)}`;
+    timeDisplay.textContent = `${formatTime(Number(seekBar.value))} / ${formatTime(safeDuration())}`;
   };
   const onSeekChange = () => {
     video.currentTime = Number(seekBar.value);
@@ -659,11 +704,11 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
     togglePopup(overflowAnchor, () => {
       const items: HTMLButtonElement[] = [];
 
-      // Captions — only show if tracks exist
-      const trackCount = video.textTracks.length;
-      if (trackCount > 0) {
+      // Captions — show if metadata or extracted tracks exist
+      const hasSubtitles = subtitleMeta.length > 0 || video.textTracks.length > 0;
+      if (hasSubtitles) {
         let activeLang = 'Off';
-        for (let i = 0; i < trackCount; i++) {
+        for (let i = 0; i < video.textTracks.length; i++) {
           if (video.textTracks[i].mode === 'showing') {
             activeLang =
               video.textTracks[i].label || video.textTracks[i].language || `Track ${i + 1}`;
@@ -682,29 +727,53 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
                 }
                 subItems.push(
                   popupItem('Off', !anyShowing, () => {
+                    pendingSubtitleIndex = null;
                     for (let i = 0; i < video.textTracks.length; i++) {
                       video.textTracks[i].mode = 'disabled';
                     }
                   }),
                 );
-                for (let i = 0; i < video.textTracks.length; i++) {
-                  const track = video.textTracks[i];
-                  const label = track.label || track.language || `Track ${i + 1}`;
-                  subItems.push(
-                    popupItem(label, track.mode === 'showing', () => {
-                      for (let j = 0; j < video.textTracks.length; j++) {
-                        video.textTracks[j].mode = 'disabled';
-                      }
-                      track.mode = 'showing';
-                    }),
-                  );
+
+                if (subtitleMeta.length > 0) {
+                  for (const meta of subtitleMeta) {
+                    const existing = extractedTracks.get(meta.index);
+                    const isShowing = existing?.mode === 'showing';
+                    const isPending = pendingSubtitleIndex === meta.index;
+                    const label = isPending ? `${meta.label} (loading…)` : meta.label;
+                    subItems.push(
+                      popupItem(label, isShowing, () => {
+                        if (existing) {
+                          for (let i = 0; i < video.textTracks.length; i++) {
+                            video.textTracks[i].mode = 'disabled';
+                          }
+                          existing.mode = 'showing';
+                        } else {
+                          pendingSubtitleIndex = meta.index;
+                          onSubtitleRequest?.(meta.index);
+                        }
+                      }),
+                    );
+                  }
+                } else {
+                  for (let i = 0; i < video.textTracks.length; i++) {
+                    const track = video.textTracks[i];
+                    const label = track.label || track.language || `Track ${i + 1}`;
+                    subItems.push(
+                      popupItem(label, track.mode === 'showing', () => {
+                        for (let j = 0; j < video.textTracks.length; j++) {
+                          video.textTracks[j].mode = 'disabled';
+                        }
+                        track.mode = 'showing';
+                      }),
+                    );
+                  }
                 }
                 return subItems;
               });
             },
             ICON.cc,
             activeLang,
-            false, // don't auto-close — opens sub-menu
+            false,
           ),
         );
       }
@@ -808,6 +877,9 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
       document.removeEventListener('mousedown', onDocMouseDown);
       container.removeEventListener('mousemove', onMouseMove);
       overlay.remove();
+    },
+    updateSubtitleTracks(tracks: SubtitleTrackMeta[]) {
+      subtitleMeta = tracks;
     },
   };
 }

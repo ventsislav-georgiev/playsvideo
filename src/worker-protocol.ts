@@ -26,3 +26,13 @@ export interface WorkerSubtitleProgressMessage {
   elapsedMs: number;
   queueDelayMs?: number;
 }
+
+/** Incremental batch of cleaned subtitle cues sent from worker → main thread. */
+export interface WorkerSubtitleBatchMessage {
+  type: 'subtitle-batch';
+  trackIndex: number;
+  codec: string;
+  cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
+  done: boolean;
+  totalCues: number;
+}

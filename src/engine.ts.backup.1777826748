@@ -29,12 +29,6 @@ import {
   subtitleDataToWebVTT,
   type SubtitleExtractionProgress,
 } from './pipeline/subtitle.js';
-import {
-  seekSubtitleInMkv,
-  getMkvSeekingMetadata,
-  type SeekSubtitleOptions,
-  type SeekSubtitleResult,
-} from './pipeline/subtitle-seeking.js';
 import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import { isAbortableSource } from './pipeline/source-signal.js';
 import type {
@@ -42,7 +36,6 @@ import type {
   KeyframeIndex,
   PlannedSegment,
   SubtitleTrackInfo,
-  SubtitleCueEntry,
 } from './pipeline/types.js';
 import type { TranscodeWorkerSnapshot, TranscodeWorkerStateMessage } from './transcode-protocol.js';
 import type {
@@ -148,29 +141,6 @@ export interface ExternalSubtitleOptions {
   language?: string;
   kind?: 'subtitles' | 'captions';
 }
-
-export interface SubtitleSeekingOptions {
-  /** Target time in seconds to seek to */
-  targetTimeSec: number;
-  /** Subtitle track index to seek within */
-  trackIndex: number;
-  /** Optional abort signal for cancellation */
-  signal?: AbortSignal;
-}
-
-export interface SubtitleSeekingResult {
-  /** Cues found in the preroll + target range */
-  cues: SubtitleCueEntry[];
-  /** Actual preroll start time (seconds) */
-  prerollStartSec: number;
-  /** Actual target time (seconds) */
-  targetTimeSec: number;
-  /** Number of cues scanned to find results */
-  cuesScanned: number;
-  /** Time spent seeking (milliseconds) */
-  elapsedMs: number;
-}
-
 
 export interface CodecDescriptor {
   short: string | null;
@@ -313,12 +283,6 @@ export class PlaysVideoEngine extends EventTarget {
       mlog('video play → hls.startLoad');
     }
     this.worker?.postMessage({ type: 'resume' });
-  };
-
-  private _onVideoSeeked = (): void => {
-    const seekTime = this.video.currentTime;
-    mlog(`video seeked → t=${seekTime.toFixed(3)}, re-requesting embedded subtitles`);
-    this.restartEmbeddedSubtitlesFromPosition(seekTime);
   };
 
   get phase(): EnginePhase {
@@ -497,7 +461,6 @@ export class PlaysVideoEngine extends EventTarget {
   private reset(detail: LoadingDetail): void {
     this.video.removeEventListener('pause', this._onVideoPause);
     this.video.removeEventListener('play', this._onVideoPlay);
-    this.video.removeEventListener('seeked', this._onVideoSeeked);
 
     if (this.hls) {
       this.hls.destroy();
@@ -629,72 +592,9 @@ export class PlaysVideoEngine extends EventTarget {
     this.dispatchWorkerStateChange();
   }
 
-  /**
-   * Seek to a specific time within a subtitle track.
-   * Only works for MKV files with Cues index.
-   */
-  async seekSubtitle(options: SubtitleSeekingOptions): Promise<SeekSubtitleResult | null> {
-    if (!this._sourceDemux) {
-      throw new Error('Load a video before seeking subtitles');
-    }
-
-    if (options.trackIndex < 0 || options.trackIndex >= this._subtitleTracks.length) {
-      throw new Error(`Subtitle track ${options.trackIndex} not found`);
-    }
-
-    try {
-      const result = await seekSubtitleInMkv(
-        this._sourceDemux.input,
-        options.trackIndex,
-        {
-          targetTimeSec: options.targetTimeSec,
-          signal: options.signal,
-        }
-      );
-      return result;
-    } catch (error) {
-      mlog(`Subtitle seeking failed: ${String(error)}`);
-      return null;
-    }
-  }
-
-  /**
-   * Get metadata about subtitle seeking capabilities for a track.
-   * Returns null if seeking is unavailable (non-MKV, no Cues, etc).
-   */
-  async getSubtitleSeekingMetadata(trackIndex: number): Promise<{
-    hasCuesIndex: boolean;
-    cueCount: number;
-    estimatedLatencyMs: number;
-  } | null> {
-    if (!this._sourceDemux) {
-      return null;
-    }
-
-    if (trackIndex < 0 || trackIndex >= this._subtitleTracks.length) {
-      return null;
-    }
-
-    try {
-      const metadata = await getMkvSeekingMetadata(this._sourceDemux.input);
-      if (!metadata) {
-        return null;
-      }
-
-      return {
-        hasCuesIndex: metadata.hasCuesIndex,
-        cueCount: metadata.cueCount,
-        estimatedLatencyMs: metadata.estimatedSeekLatencyMs,
-      };
-    } catch {
-      return null;
-    }
-  }
-
   destroy(): void {
     this.video.removeEventListener('pause', this._onVideoPause);
     this.video.removeEventListener('play', this._onVideoPlay);
-    this.video.removeEventListener('seeked', this._onVideoSeeked);
 
     if (this.hls) {
       this.hls.destroy();
@@ -1752,7 +1652,6 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.video.addEventListener('pause', this._onVideoPause);
     this.video.addEventListener('play', this._onVideoPlay);
-    this.video.addEventListener('seeked', this._onVideoSeeked);
 
     for (const evt of ['waiting', 'stalled', 'playing'] as const) {
       this.video.addEventListener(evt, () => {
@@ -1950,27 +1849,6 @@ export class PlaysVideoEngine extends EventTarget {
     this.attachedSubtitleTracks = keep;
   }
 
-  private restartEmbeddedSubtitlesFromPosition(seekTimeSec: number): void {
-    if (!this.worker) return;
-    const activeEmbedded = this.attachedSubtitleTracks.filter(
-      (a) => a.source === 'embedded' && a.textTrack && a.textTrack.mode !== 'disabled',
-    );
-    if (activeEmbedded.length === 0) return;
-
-    for (const attached of activeEmbedded) {
-      const tt = attached.textTrack!;
-      while (tt.cues && tt.cues.length > 0) {
-        tt.removeCue(tt.cues[0]);
-      }
-      const trackIndex = attached.trackIndex;
-      if (trackIndex == null) continue;
-      const info = this._subtitleTracks.find((t) => t.index === trackIndex);
-      if (info) {
-        this.requestEmbeddedSubtitleTrack(info, seekTimeSec);
-      }
-    }
-  }
-
   private showTextTrack(track: HTMLTrackElement | TextTrack): void {
     for (let i = 0; i < this.video.textTracks.length; i++) {
       this.video.textTracks[i].mode = 'disabled';
@@ -1984,14 +1862,14 @@ export class PlaysVideoEngine extends EventTarget {
     this.dispatchEvent(new CustomEvent('subtitle-status', { detail: { message } }));
   }
 
-  private requestEmbeddedSubtitleTrack(track: SubtitleTrackInfo, seekTimeSec?: number): void {
+  private requestEmbeddedSubtitleTrack(track: SubtitleTrackInfo): void {
     const requestedAtMs = Date.now();
     this.subtitleRequestTimes.set(track.index, requestedAtMs);
     mlog(`requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec}`);
     this.dispatchSubtitleStatus(
       `Subtitle track ${track.index}: ${track.language ?? '?'} ${track.codec} queued`,
     );
-    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestedAtMs, seekTimeSec });
+    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestedAtMs });
   }
 
   private handleWorkerSubtitleProgress(msg: WorkerSubtitleProgressMessage): void {

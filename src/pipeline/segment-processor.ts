@@ -1,4 +1,4 @@
-import type { EncodedPacket, EncodedPacketSink } from 'mediabunny';
+import { EncodedPacket, type EncodedPacketSink } from 'mediabunny';
 import type { AudioTranscodeExecutor } from './audio-transcode.js';
 import { collectPacketsInRange } from './demux.js';
 import { muxToFmp4 } from './mux.js';
@@ -57,6 +57,29 @@ export async function processSegmentWithAbort(
   });
   log(`seg ${index} video-collect ${elapsed(tVid)} pkts=${videoPackets.length}`);
 
+  // Stretch the last video frame's duration to cover to the segment boundary.
+  // Without this, a gap forms between the last frame's end (timestamp+duration)
+  // and the next segment's first keyframe — Safari MSE stalls at these gaps
+  // and seeks past them, causing visible playback skips.
+  if (videoPackets.length > 0) {
+    const last = videoPackets[videoPackets.length - 1];
+    const videoEnd = last.timestamp + last.duration;
+    if (videoEnd < endSec) {
+      const stretchedDuration = endSec - last.timestamp;
+      videoPackets[videoPackets.length - 1] = new EncodedPacket(
+        last.data, last.type, last.timestamp, stretchedDuration,
+        last.sequenceNumber, last.byteLength, last.sideData,
+      );
+    }
+  }
+
+  if (videoPackets.length > 0) {
+    const vidFirst = videoPackets[0].timestamp;
+    const vidLast = videoPackets[videoPackets.length - 1];
+    const vidEnd = vidLast.timestamp + vidLast.duration;
+    log(`seg ${index} src-video ts=[${vidFirst.toFixed(4)},${vidEnd.toFixed(4)}] dur=${(vidEnd - vidFirst).toFixed(4)} pkts=${videoPackets.length}`);
+  }
+
   checkAbort(signal);
 
   // Stage 2: Collect audio packets
@@ -65,6 +88,14 @@ export async function processSegmentWithAbort(
     ? await collectPacketsInRange(config.audioSink, seg.startSec, endSec)
     : [];
   log(`seg ${index} audio-collect ${elapsed(tAud)} pkts=${audioPackets.length}`);
+
+  if (audioPackets.length > 0) {
+    const srcFirst = audioPackets[0].timestamp;
+    const srcLast = audioPackets[audioPackets.length - 1];
+    const srcEnd = srcLast.timestamp + srcLast.duration;
+    const srcDur = srcEnd - srcFirst;
+    log(`seg ${index} src-audio ts=[${srcFirst.toFixed(4)},${srcEnd.toFixed(4)}] dur=${srcDur.toFixed(4)} pktDur=${audioPackets[0].duration.toFixed(6)}`);
+  }
 
   checkAbort(signal);
 
@@ -76,7 +107,7 @@ export async function processSegmentWithAbort(
       {
         packets: audioPackets,
         sampleRate,
-        audioStartSec: audioPackets[0].timestamp,
+        audioStartSec: seg.startSec,
         sourceCodec: config.sourceCodec,
       },
       signal,
@@ -87,6 +118,13 @@ export async function processSegmentWithAbort(
       `seg ${index} transcode ${m.totalMs.toFixed(1)}ms audio=${m.audioDurationSec.toFixed(2)}s ratio=${m.realtimeRatio.toFixed(4)}x ffmpeg=${m.ffmpegMs.toFixed(1)}ms${speed}`,
     );
     audioPackets = transcoded.packets;
+    if (audioPackets.length > 0) {
+      const outFirst = audioPackets[0].timestamp;
+      const outLast = audioPackets[audioPackets.length - 1];
+      const outEnd = outLast.timestamp + outLast.duration;
+      const gapToSegEnd = endSec - outEnd;
+      log(`seg ${index} out-audio sr=${transcoded.decoderConfig.sampleRate} frames=${audioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${gapToSegEnd.toFixed(4)}`);
+    }
     if (!audioDecoderConfig || audioDecoderConfig.codec !== 'mp4a.40.2') {
       audioDecoderConfig = transcoded.decoderConfig;
     }

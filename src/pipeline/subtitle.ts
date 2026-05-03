@@ -14,6 +14,19 @@ export interface SubtitleExtractionProgress {
 
 export interface ExtractSubtitleDataOptions {
   onProgress?: (progress: SubtitleExtractionProgress) => void;
+  signal?: AbortSignal;
+}
+
+export interface StreamSubtitleOptions {
+  onBatch: (batch: SubtitleCueEntry[], done: boolean, totalCues: number, codec: string) => void;
+  onProgress?: (progress: SubtitleExtractionProgress) => void;
+  signal?: AbortSignal;
+  /** Cues per first batch (fast initial display). Default 20. */
+  firstBatchSize?: number;
+  /** Cues per subsequent batch. Default 200. */
+  batchSize?: number;
+  /** If set, start reading cues from this timestamp (seconds) using seek-based access. */
+  startTimeSec?: number;
 }
 
 /** Discover subtitle tracks from a demuxed input. Cheap — reads only metadata, no cue extraction. */
@@ -66,6 +79,7 @@ export async function extractSubtitleData(
   reportProgress('starting', 0);
 
   for await (const cue of track.getCues()) {
+    if (options.signal?.aborted) break;
     rawCues.push(cue);
     const now = performance.now();
     if (
@@ -83,7 +97,7 @@ export async function extractSubtitleData(
 
   // For ASS/SSA, try to get the header from exportToText
   let header: string | undefined;
-  if (codec === 'ass' || codec === 'ssa') {
+  if ((codec === 'ass' || codec === 'ssa') && !options.signal?.aborted) {
     reportProgress('exporting-text');
     const exported = await track.exportToText();
     header = extractAssHeader(exported);
@@ -92,6 +106,83 @@ export async function extractSubtitleData(
   reportProgress('done', cues.length);
 
   return { cues, codec, header };
+}
+
+/**
+ * Stream subtitle cues in batches as they are read from the demuxer.
+ * First batch is small for fast initial display; subsequent batches are larger.
+ */
+export async function extractSubtitleDataStreaming(
+  input: Input,
+  trackIndex: number,
+  options: StreamSubtitleOptions,
+): Promise<{ codec: string; header?: string }> {
+  const tracks = await input.getSubtitleTracks();
+  const track = tracks[trackIndex];
+  if (!track) {
+    throw new Error(`Subtitle track index ${trackIndex} not found`);
+  }
+
+  const codec = track.codec ?? 'unknown';
+  const firstBatchSize = options.firstBatchSize ?? 20;
+  const batchSize = options.batchSize ?? 200;
+
+  const startedAt = performance.now();
+  let lastReportedAt = startedAt;
+  let lastReportedCues = 0;
+  let totalCuesSent = 0;
+  let pending: SubtitleCue[] = [];
+
+  const reportProgress = (phase: SubtitleExtractionPhase, cuesRead: number): void => {
+    options.onProgress?.({ trackIndex, codec, phase, cuesRead, elapsedMs: performance.now() - startedAt });
+  };
+
+  const flushBatch = (done: boolean): void => {
+    if (pending.length === 0 && !done) return;
+    const cleaned = cleanCues(pending, codec);
+    totalCuesSent += cleaned.length;
+    options.onBatch(cleaned, done, totalCuesSent, codec);
+    pending = [];
+  };
+
+  reportProgress('starting', 0);
+
+  const cueIterator = track.getCues();
+
+  let totalRead = 0;
+  for await (const cue of cueIterator) {
+    // Skip cues before the requested start time if specified
+    if (options.startTimeSec != null && cue.timestamp < options.startTimeSec) {
+      continue;
+    }
+    if (options.signal?.aborted) break;
+    pending.push(cue);
+    totalRead++;
+
+    const now = performance.now();
+    if (totalRead - lastReportedCues >= 250 || now - lastReportedAt >= 500 || totalRead === 1) {
+      reportProgress('reading-cues', totalRead);
+      lastReportedAt = now;
+      lastReportedCues = totalRead;
+    }
+
+    const threshold = totalCuesSent === 0 ? firstBatchSize : batchSize;
+    if (pending.length >= threshold) {
+      flushBatch(false);
+    }
+  }
+
+  flushBatch(true);
+
+  let header: string | undefined;
+  if ((codec === 'ass' || codec === 'ssa') && !options.signal?.aborted) {
+    reportProgress('exporting-text', totalRead);
+    const exported = await track.exportToText();
+    header = extractAssHeader(exported);
+  }
+
+  reportProgress('done', totalRead);
+  return { codec, header };
 }
 
 /**
@@ -280,3 +371,6 @@ function parseSRTTimestamp(ts: string): number {
   const parts = time.split(':');
   return Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]) + Number(ms) / 1000;
 }
+
+// Export helpers for use in subtitle-seeking.ts
+export { cleanCues, extractAssHeader, stripAssTags };

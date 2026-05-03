@@ -19,8 +19,7 @@ import { generateVodPlaylist } from './pipeline/playlist.js';
 import { buildSegmentPlan } from './pipeline/segment-plan.js';
 import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import {
-  extractSubtitleData,
-  subtitleDataToWebVTT,
+  extractSubtitleDataStreaming,
   type SubtitleExtractionProgress,
 } from './pipeline/subtitle.js';
 import type { KeyframeIndex, PlannedSegment } from './pipeline/types.js';
@@ -32,6 +31,7 @@ import type {
 import type {
   WorkerSegmentPhase,
   WorkerSegmentStateMessage,
+  WorkerSubtitleBatchMessage,
   WorkerSubtitleProgressMessage,
 } from './worker-protocol.js';
 
@@ -46,6 +46,9 @@ function elapsed(start: number): string {
 function makeAbortError(): DOMException {
   return new DOMException('Segment aborted', 'AbortError');
 }
+
+let paused = false;
+let prefetchAbort: AbortController | null = null;
 
 function emitSegmentState(
   index: number,
@@ -315,6 +318,38 @@ let pipelineSetup: Promise<void> = Promise.resolve();
 // Per-segment abort controllers for cancellation
 const segmentAbortControllers = new Map<number, AbortController>();
 
+// --- Subtitle queue: sequential extraction with segment priority ---
+// Subtitles share the same I/O source as segment processing. Running many
+// extractions concurrently starves segment reads and causes frame drops.
+// Queue them and pause while any segment is actively processing.
+let activeSegmentCount = 0;
+let subtitleInProgress = false;
+let subtitleAbort: AbortController | null = null;
+const subtitleQueue: Array<{ trackIndex: number; requestedAtMs?: number; seekTimeSec?: number }> = [];
+
+function enqueueSubtitle(trackIndex: number, requestedAtMs?: number, seekTimeSec?: number): void {
+  subtitleQueue.push({ trackIndex, requestedAtMs, seekTimeSec });
+  void drainSubtitleQueue();
+}
+
+async function drainSubtitleQueue(): Promise<void> {
+  if (subtitleInProgress) return;
+  const next = subtitleQueue.shift();
+  if (!next) return;
+
+  subtitleInProgress = true;
+  const queueDelayMs =
+    typeof next.requestedAtMs === 'number' ? Math.max(0, Date.now() - next.requestedAtMs) : 0;
+  try {
+    await handleSubtitle(next.trackIndex, queueDelayMs, next.seekTimeSec);
+  } catch (err) {
+    self.postMessage({ type: 'error', message: String(err) });
+  } finally {
+    subtitleInProgress = false;
+    void drainSubtitleQueue();
+  }
+}
+
 self.onmessage = (event: MessageEvent) => {
   const msg = event.data;
 
@@ -360,12 +395,25 @@ self.onmessage = (event: MessageEvent) => {
       controller.abort();
       segmentAbortControllers.delete(msg.index);
     }
+  } else if (msg.type === 'pause') {
+    paused = true;
+    if (prefetchAbort) {
+      prefetchAbort.abort();
+      prefetchAbort = null;
+    }
+    if (subtitleAbort) {
+      subtitleAbort.abort();
+      subtitleAbort = null;
+    }
+    subtitleQueue.length = 0;
+    wlog('recv pause — prefetch suspended, subtitle extraction aborted');
+  } else if (msg.type === 'resume') {
+    paused = false;
+    prefetchAbort = new AbortController();
+    wlog('recv resume — prefetch resumed');
   } else if (msg.type === 'subtitle') {
-    wlog(`recv subtitle trackIndex=${msg.trackIndex}`);
-    const queueDelayMs = typeof msg.requestedAtMs === 'number' ? Date.now() - msg.requestedAtMs : 0;
-    handleSubtitle(msg.trackIndex, Math.max(0, queueDelayMs)).catch((err) =>
-      self.postMessage({ type: 'error', message: String(err) }),
-    );
+    wlog(`recv subtitle trackIndex=${msg.trackIndex} seekTimeSec=${msg.seekTimeSec ?? 'none'}`);
+    enqueueSubtitle(msg.trackIndex, msg.requestedAtMs, msg.seekTimeSec);
   }
 };
 
@@ -399,16 +447,20 @@ function shouldPrefetchSegments(): boolean {
 }
 
 function schedulePrefetch(startIndex: number): void {
-  if (!shouldPrefetchSegments()) {
+  if (paused || !shouldPrefetchSegments()) {
     return;
   }
+
+  if (!prefetchAbort) prefetchAbort = new AbortController();
+  const signal = prefetchAbort.signal;
 
   const maxInFlight = transcodePool.workerCount();
   let nextIndex = startIndex;
   while (segmentTasks.size < maxInFlight && nextIndex < plan.length) {
     if (!segmentCache.has(nextIndex) && !segmentTasks.has(nextIndex)) {
       emitSegmentState(nextIndex, 'prefetching');
-      void ensureSegmentTask(nextIndex).catch((err) => {
+      void ensureSegmentTask(nextIndex, signal).catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         emitSegmentState(nextIndex, 'error', { message: String(err) });
         self.postMessage({ type: 'error', message: String(err) });
       });
@@ -417,7 +469,7 @@ function schedulePrefetch(startIndex: number): void {
   }
 }
 
-async function ensureSegmentTask(index: number): Promise<Uint8Array> {
+async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<Uint8Array> {
   const cached = segmentCache.get(index);
   if (cached) {
     return cached;
@@ -431,7 +483,7 @@ async function ensureSegmentTask(index: number): Promise<Uint8Array> {
   const task = (async () => {
     const t0 = performance.now();
     emitSegmentState(index, 'processing');
-    const result = await processSegmentWithAbort(makeProcessorConfig(), index);
+    const result = await processSegmentWithAbort(makeProcessorConfig(), index, signal);
     if (!initSegment && result.initSegment) {
       initSegment = result.initSegment;
       wlog(`init-segment captured size=${initSegment.byteLength}`);
@@ -607,6 +659,7 @@ function isStaleFileError(err: unknown): boolean {
 }
 
 async function handleSegmentRequest(index: number) {
+  activeSegmentCount++;
   const controller = new AbortController();
   segmentAbortControllers.set(index, controller);
   emitSegmentState(index, 'queued');
@@ -628,6 +681,8 @@ async function handleSegmentRequest(index: number) {
     }
   } finally {
     segmentAbortControllers.delete(index);
+    activeSegmentCount--;
+    void drainSubtitleQueue();
   }
 }
 
@@ -688,22 +743,43 @@ function emitSubtitleProgress(
   self.postMessage(message);
 }
 
-async function handleSubtitle(trackIndex: number, queueDelayMs = 0) {
+async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?: number) {
   if (!demux) {
     self.postMessage({ type: 'error', message: 'No file open' });
     return;
   }
 
+  subtitleAbort = new AbortController();
+  const { signal } = subtitleAbort;
+
   const t0 = performance.now();
   let hasSentStart = false;
-  const data = await extractSubtitleData(demux.input, trackIndex, {
+  const { codec } = await extractSubtitleDataStreaming(demux.input, trackIndex, {
+    onBatch(cues, done, totalCues, batchCodec) {
+      const message: WorkerSubtitleBatchMessage = {
+        type: 'subtitle-batch',
+        trackIndex,
+        codec: batchCodec,
+        cues,
+        done,
+        totalCues,
+      };
+      self.postMessage(message);
+    },
     onProgress(progress) {
       emitSubtitleProgress(trackIndex, progress, hasSentStart ? 0 : queueDelayMs);
       hasSentStart = true;
     },
+    signal,
+    startTimeSec: seekTimeSec,
   });
-  const webvtt = subtitleDataToWebVTT(data);
-  wlog(`subtitle track=${trackIndex} cues=${data.cues.length} codec=${data.codec} ${elapsed(t0)}`);
 
-  self.postMessage({ type: 'subtitle', trackIndex, webvtt, codec: data.codec });
+  subtitleAbort = null;
+
+  if (signal.aborted) {
+    wlog(`subtitle track=${trackIndex} aborted`);
+    return;
+  }
+
+  wlog(`subtitle track=${trackIndex} streaming done codec=${codec} seekFrom=${seekTimeSec ?? 0} ${elapsed(t0)}`);
 }

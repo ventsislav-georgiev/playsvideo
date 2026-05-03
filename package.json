@@ -24,6 +24,7 @@
     "build": "pnpm run build:site && pnpm run build:lib",
     "build:site": "vite build",
     "build:lib": "rm -rf dist && tsc -p tsconfig.lib.json && mkdir -p dist/vendor && cp -r src/vendor/ffmpeg-core-audio dist/vendor/ffmpeg-core-audio",
+    "build:bundle": "vite build --config vite.config.bundle.ts",
     "build:extension": "vite build --config vite.config.extension.ts",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
@@ -47,7 +48,7 @@
   },
   "dependencies": {
     "hls.js": "^1.5.0",
-    "mediabunny": "github:kzahel/mediabunny#integration"
+    "mediabunny": "file:../mediabunny"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.6",

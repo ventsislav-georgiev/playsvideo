@@ -127,7 +127,17 @@ export async function getKeyframeIndex(
   while (packet) {
     const ts = packet.timestamp;
     if (Number.isFinite(ts) && ts >= 0) {
-      keyframes.push({ timestamp: ts, sequenceNumber: packet.sequenceNumber });
+      // Round-trip validate: ensure getKeyPacket(ts) can actually find this
+      // keyframe. Some demuxers (e.g. Matroska) discover keyframes via
+      // decode-order iteration that per-cluster PTS lookup can't resolve.
+      // If the plan uses such a "phantom" boundary, collectPacketsInRange
+      // backtracks to a much earlier keyframe, creating a large video/audio
+      // start-time mismatch in the muxed fMP4 — which Chrome MSE can't
+      // handle (progressive A/V desync).
+      const found = await videoSink.getKeyPacket(ts, { metadataOnly: true });
+      if (found && Math.abs(found.timestamp - ts) < 0.002) {
+        keyframes.push({ timestamp: ts, sequenceNumber: packet.sequenceNumber });
+      }
     }
     const next = await videoSink.getNextKeyPacket(packet, {
       metadataOnly: true,
@@ -150,6 +160,20 @@ export async function collectPacketsInRange(
   let packet: EncodedPacket | null = null;
   if (opts?.startFromKeyframe) {
     packet = await sink.getKeyPacket(startSec);
+    // getKeyPacket uses "floor" semantics (last keyframe with PTS <= startSec).
+    // For HEVC B-frame content in MKV, the returned keyframe can be a full GOP
+    // earlier than startSec when the actual keyframe at startSec sits on a
+    // cluster boundary that the per-cluster PTS lookup misses.  Stepping forward
+    // via getNextKeyPacket finds the real keyframe and keeps video/audio start
+    // times aligned in the muxed fMP4 — critical for Chrome MSE which can't
+    // handle large A/V start-time mismatches.
+    if (packet && startSec - packet.timestamp > 0.5) {
+      let next = await sink.getNextKeyPacket(packet);
+      while (next && next.timestamp <= startSec + 0.05) {
+        packet = next;
+        next = await sink.getNextKeyPacket(next);
+      }
+    }
   } else {
     packet = await sink.getPacket(startSec);
   }
@@ -157,6 +181,23 @@ export async function collectPacketsInRange(
     packet = await sink.getFirstPacket();
   }
   if (!packet) return packets;
+
+  // For non-keyframe collection (audio), skip any initial packet whose
+  // timestamp falls before startSec — the previous segment already owns it.
+  // Without this, getPacket() "floor" semantics cause one AAC frame (~21 ms)
+  // to appear in two consecutive fMP4 fragments, producing overlap that
+  // manifests as stutter (Safari) or progressive A/V desync (Chrome).
+  if (!opts?.startFromKeyframe) {
+    while (packet && packet.timestamp < startSec) {
+      const next = await sink.getNextPacket(packet);
+      if (!next || next.sequenceNumber === packet.sequenceNumber) {
+        packet = null;
+        break;
+      }
+      packet = next;
+    }
+    if (!packet) return packets;
+  }
 
   // Collect packets until we reach endSec
   while (packet) {

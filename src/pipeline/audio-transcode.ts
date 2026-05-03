@@ -203,7 +203,10 @@ export function packetsFromAdtsData(
 } {
   const tParse = now();
   const frames = parseAdtsFrames(aacData);
-  const frameDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
+  // Use actual output sample rate from ADTS headers, not the passed source rate —
+  // ffmpeg may output at a different rate than the source codec.
+  const actualSampleRate = frames[0]?.sampleRate ?? sampleRate;
+  const frameDuration = SAMPLES_PER_AAC_FRAME / actualSampleRate;
 
   let timestamp = audioStartSec;
   const packets = frames.map((frame, i) => {
