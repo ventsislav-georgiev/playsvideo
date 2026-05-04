@@ -202,7 +202,11 @@ export function packetsFromAdtsData(
   outputDurationSec: number;
 } {
   const tParse = now();
-  const frames = parseAdtsFrames(aacData);
+  const allFrames = parseAdtsFrames(aacData);
+  // Drop the first ADTS frame: ffmpeg's native AAC encoder has initial_padding
+  // of 1024 samples (one frame). In ADTS output this priming frame is included
+  // verbatim, so keeping it shifts real audio content by ~21 ms at 48 kHz.
+  const frames = allFrames.length > 1 ? allFrames.slice(1) : allFrames;
   // Use actual output sample rate from ADTS headers, not the passed source rate —
   // ffmpeg may output at a different rate than the source codec.
   const actualSampleRate = frames[0]?.sampleRate ?? sampleRate;

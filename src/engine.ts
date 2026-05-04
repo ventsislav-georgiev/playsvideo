@@ -20,7 +20,7 @@ import {
   type PlaybackOptionEvaluation,
 } from './playback-selection.js';
 import { createLocalAudioTranscoder, makeAacDecoderConfig } from './pipeline/audio-transcode.js';
-import type { DemuxResult } from './pipeline/demux.js';
+import type { DemuxResult, SegmentBoundaryResolver } from './pipeline/demux.js';
 import { generateVodPlaylist } from './pipeline/playlist.js';
 import { buildSegmentPlan } from './pipeline/segment-plan.js';
 import {
@@ -117,6 +117,12 @@ export interface SegmentState {
   error: string | null;
   prefetched: boolean;
   events: SegmentTimelineEvent[];
+}
+
+interface BufferedGap {
+  start: number;
+  end: number;
+  gap: number;
 }
 
 export interface SegmentStateDetail {
@@ -227,6 +233,7 @@ export class PlaysVideoEngine extends EventTarget {
   private transcodeWorkers: TranscodeWorkerHandle[] = [];
   private _transcodeWorkerStates: WasmWorkerState[] = [];
   private _segmentStates = new Map<number, SegmentState>();
+  private _lastBufferedGapsBySegment = new Map<number, BufferedGap[]>();
   private hls: Hls | null = null;
 
   // Pending segment requests from hls.js custom loader
@@ -255,6 +262,10 @@ export class PlaysVideoEngine extends EventTarget {
   private _subtitleTracks: SubtitleTrackInfo[] = [];
   private subtitleWindowEnd = new Map<number, number>();
   private subtitleWindowLoading = new Set<number>();
+  private subtitleRequestedWindowEnd = new Map<number, number>();
+  private _selectOnExtract = new Map<number, boolean>();
+  private _subtitleRequestSeq = 0;
+  private _activeSubtitleRequestIds = new Map<number, number>();
 
   // Public read-only state
   private _phase: EnginePhase = 'idle';
@@ -280,6 +291,7 @@ export class PlaysVideoEngine extends EventTarget {
   private _source: Source | null = null;
   private _sourceDemux: DemuxResult | null = null;
   private _sourcePlan: PlannedSegment[] = [];
+  private _sourceBoundaryResolver: SegmentBoundaryResolver | null = null;
   private _sourceDoTranscode = false;
   private _sourceAudioDecoderConfig: AudioDecoderConfig | null = null;
   private _sourceInitSegment: Uint8Array | null = null;
@@ -339,14 +351,21 @@ export class PlaysVideoEngine extends EventTarget {
     return this._subtitleTracks;
   }
 
-  requestSubtitleExtraction(trackIndex: number): boolean {
+  requestSubtitleExtraction(trackIndex: number, select = true): boolean {
     const track = this._subtitleTracks.find((t) => t.index === trackIndex);
     if (!track || !this.worker) return false;
+    if (select) {
+      this.cancelPendingSubtitleWork();
+    }
     const alreadyExtracted = this.attachedSubtitleTracks.some(
       (a) => a.source === 'embedded' && a.trackIndex === trackIndex,
     );
-    if (alreadyExtracted) return false;
-    this.requestEmbeddedSubtitleTrack(track);
+    if (select) {
+      this.showOnlyEmbeddedSubtitleTrack(trackIndex);
+    }
+    if (alreadyExtracted) return true;
+    this._selectOnExtract.set(trackIndex, select);
+    this.requestEmbeddedSubtitleTrack(track, select ? this.video.currentTime || 0 : undefined);
     return true;
   }
 
@@ -473,6 +492,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._sourcePlaybackPolicy = 'auto';
     this._source = source;
     this._sourcePlan = [];
+    this._sourceBoundaryResolver = null;
     this._sourceDoTranscode = false;
     this._sourceAudioDecoderConfig = null;
     this._sourceInitSegment = null;
@@ -486,6 +506,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._keyframeIndex = null;
     this._source = input.source;
     this._sourcePlan = [];
+    this._sourceBoundaryResolver = null;
     this._sourceDoTranscode = false;
     this._sourceAudioDecoderConfig = null;
     this._sourceInitSegment = null;
@@ -527,6 +548,9 @@ export class PlaysVideoEngine extends EventTarget {
     this.subtitleRequestTimes.clear();
     this.subtitleWindowEnd.clear();
     this.subtitleWindowLoading.clear();
+    this.subtitleRequestedWindowEnd.clear();
+    this._activeSubtitleRequestIds.clear();
+    this._selectOnExtract.clear();
     this.removeSubtitleTracks();
 
     this._phase = 'demuxing';
@@ -563,6 +587,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._sourceDemux?.dispose();
     this._sourceDemux = null;
     this._sourcePlan = [];
+    this._sourceBoundaryResolver = null;
     this._sourceDoTranscode = false;
     this._sourceAudioDecoderConfig = null;
     this._sourceInitSegment = null;
@@ -878,6 +903,43 @@ export class PlaysVideoEngine extends EventTarget {
       sizeBytes: msg.sizeBytes,
       message: msg.message,
     });
+  }
+
+  private getSegmentContinuitySnapshot(index: number): string {
+    const state = this._segmentStates.get(index);
+    if (!state || state.events.length === 0) {
+      return 'timeline=unavailable';
+    }
+
+    const startedAt = state.events[0]?.atMs ?? null;
+    const finishedAt = [...state.events]
+      .reverse()
+      .find((event) => event.phase === 'delivered' || event.phase === 'ready')?.atMs;
+    const totalMs =
+      startedAt !== null && finishedAt !== undefined ? Math.max(0, finishedAt - startedAt) : null;
+
+    const phaseParts: string[] = [];
+    const interestingPhases: SegmentPhase[] = [
+      'requested',
+      'prefetching',
+      'processing',
+      'ready',
+      'cache-hit',
+      'delivered',
+      'error',
+    ];
+    for (const phase of interestingPhases) {
+      const event = [...state.events].reverse().find((entry) => entry.phase === phase);
+      if (event && startedAt !== null) {
+        phaseParts.push(`${phase}@+${(event.atMs - startedAt).toFixed(1)}ms`);
+      }
+    }
+
+    const timeline = phaseParts.length > 0 ? phaseParts.join(' ') : 'timeline=missing';
+    const latency = state.latencyMs !== null ? `latency=${state.latencyMs.toFixed(1)}ms` : 'latency=?';
+    const size = state.sizeBytes !== null ? `size=${state.sizeBytes}` : 'size=?';
+    const total = totalMs !== null ? `total=${totalMs.toFixed(1)}ms` : 'total=?';
+    return `${latency} ${size} ${total} ${timeline}`;
   }
 
   private recordInternalError(message: string): string {
@@ -1268,7 +1330,7 @@ export class PlaysVideoEngine extends EventTarget {
 
   private async startSourcePipeline(source: Source): Promise<void> {
     try {
-      const { demuxSource, getKeyframeIndex } = await import('./pipeline/demux.js');
+      const { createVideoBoundaryResolver, demuxSource, getKeyframeIndex } = await import('./pipeline/demux.js');
       const { buildMkvKeyframeIndexFromSource } = await import('./pipeline/mkv-keyframe-index.js');
 
       mlog('source pipeline: demuxing');
@@ -1297,6 +1359,11 @@ export class PlaysVideoEngine extends EventTarget {
         durationSec: index.duration,
         targetSegmentDurationSec: this._sourceTargetSegDuration,
       });
+      this._sourceBoundaryResolver = createVideoBoundaryResolver(
+        demux.videoSink,
+        this._sourcePlan,
+        (msg) => mlog(`source pipeline: ${msg}`),
+      );
 
       const media: PlaybackMediaMetadata = {
         sourceVideoCodec: demux.videoCodec,
@@ -1418,6 +1485,7 @@ export class PlaysVideoEngine extends EventTarget {
       doTranscode: this._sourceDoTranscode,
       transcodeAudio: createLocalAudioTranscoder(this._sourceFfmpeg),
       sourceCodec: demux.audioCodec ?? undefined,
+      resolveSegmentBoundary: this._sourceBoundaryResolver ?? undefined,
       log: mlog,
     };
   }
@@ -1511,8 +1579,11 @@ export class PlaysVideoEngine extends EventTarget {
         );
 
         this._sourcePrefetchCache.set(next, buf);
-      } catch {
+      } catch (e) {
         // Aborted or failed — on-demand path handles it
+        if (!(e instanceof DOMException && e.name === 'AbortError')) {
+          console.warn('[playsvideo] prefetch failed:', e);
+        }
       } finally {
         if (this._sourcePrefetchIndex === next) {
           this._sourcePrefetchAbort = null;
@@ -1717,14 +1788,48 @@ export class PlaysVideoEngine extends EventTarget {
       mlog(`hls FRAG_BUFFERED sn=${data.frag.sn}`);
       const sb = this.video.buffered;
       const ranges: string[] = [];
+      const gaps: BufferedGap[] = [];
       for (let i = 0; i < sb.length; i++) {
         ranges.push(`[${sb.start(i).toFixed(3)},${sb.end(i).toFixed(3)}]`);
         if (i > 0) {
           const gap = sb.start(i) - sb.end(i - 1);
-          if (gap > 0.01) ranges.push(`!!GAP=${gap.toFixed(3)}!!`);
+          if (gap > 0.01) {
+            ranges.push(`!!GAP=${gap.toFixed(3)}!!`);
+            gaps.push({
+              start: sb.end(i - 1),
+              end: sb.start(i),
+              gap,
+            });
+          }
         }
       }
       mlog(`hls buffered ${ranges.join(' ')}`);
+      const segmentIndex = Number(data.frag.sn);
+      const previous = this._lastBufferedGapsBySegment.get(segmentIndex) ?? [];
+      const changed =
+        previous.length !== gaps.length ||
+        previous.some((prevGap, i) => {
+          const nextGap = gaps[i];
+          if (!nextGap) return true;
+          return (
+            Math.abs(prevGap.start - nextGap.start) > 0.001 ||
+            Math.abs(prevGap.end - nextGap.end) > 0.001 ||
+            Math.abs(prevGap.gap - nextGap.gap) > 0.001
+          );
+        });
+      if (changed) {
+        this._lastBufferedGapsBySegment.set(segmentIndex, gaps);
+        if (gaps.length === 0 && previous.length > 0) {
+          mlog(`hls gap-status sn=${segmentIndex} cleared ${this.getSegmentContinuitySnapshot(segmentIndex)}`);
+        } else if (gaps.length > 0) {
+          const summary = gaps
+            .map((gap) => `[${gap.start.toFixed(3)},${gap.end.toFixed(3)})=${gap.gap.toFixed(3)}s`)
+            .join(' ');
+          mlog(
+            `hls gap-status sn=${segmentIndex} gaps=${summary} ${this.getSegmentContinuitySnapshot(segmentIndex)}`,
+          );
+        }
+      }
       const q = this.video.getVideoPlaybackQuality?.();
       if (q) {
         mlog(`hls playback-quality total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames} t=${this.video.currentTime.toFixed(3)}`);
@@ -1870,33 +1975,51 @@ export class PlaysVideoEngine extends EventTarget {
 
   private handleSubtitleBatch(msg: {
     trackIndex: number;
+    requestId?: number;
     codec: string;
     cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
     done: boolean;
     totalCues: number;
   }): void {
+    if (msg.requestId !== undefined && this._activeSubtitleRequestIds.get(msg.trackIndex) !== msg.requestId) {
+      mlog(`subtitle track ${msg.trackIndex} ignoring stale batch requestId=${msg.requestId}`);
+      return;
+    }
+
     let attached = this.attachedSubtitleTracks.find(
       (a) => a.source === 'embedded' && a.trackIndex === msg.trackIndex,
     );
+
+    const shouldSelect = this._selectOnExtract.get(msg.trackIndex) ?? true;
 
     if (!attached) {
       const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
       const kind: TextTrackKind = info?.disposition.hearingImpaired ? 'captions' : 'subtitles';
       const lang = normalizeSubtitleLanguageCode(info?.language ?? 'und');
       const label = languageLabel(info?.language ?? 'und', msg.trackIndex, info?.disposition);
-      const textTrack = this.video.addTextTrack(kind, label, lang);
-      // Always show newly created track — extraction only happens on explicit request
-      textTrack.mode = 'showing';
-      for (let i = 0; i < this.video.textTracks.length; i++) {
-        const t = this.video.textTracks[i];
-        if (t !== textTrack) t.mode = 'disabled';
+      const blob = new Blob(['WEBVTT\n\n'], { type: 'text/vtt' });
+      const url = URL.createObjectURL(blob);
+      const track = document.createElement('track');
+      track.kind = kind;
+      track.src = url;
+      track.srclang = lang;
+      track.label = label;
+      track.default = shouldSelect;
+      this.video.appendChild(track);
+      const textTrack = track.track;
+      if (shouldSelect) {
+        for (let i = 0; i < this.video.textTracks.length; i++) {
+          this.video.textTracks[i].mode = 'disabled';
+        }
+        textTrack.mode = 'hidden';
+      } else {
+        textTrack.mode = 'hidden';
       }
 
-      const dummyTrack = document.createElement('track');
-      attached = { element: dummyTrack, url: '', source: 'embedded', trackIndex: msg.trackIndex, textTrack };
+      attached = { element: track, url, source: 'embedded', trackIndex: msg.trackIndex, textTrack };
       this.attachedSubtitleTracks.push(attached);
 
-      mlog(`subtitle track ${msg.trackIndex} created incrementally kind=${kind} lang=${lang}`);
+      mlog(`subtitle track ${msg.trackIndex} created incrementally as <track kind=${kind} lang=${lang}>`);
     }
 
     const tt = attached.textTrack;
@@ -1904,10 +2027,16 @@ export class PlaysVideoEngine extends EventTarget {
 
     for (const cue of msg.cues) {
       try {
+        if (this.hasMatchingCue(tt, cue)) continue;
         const vttCue = new VTTCue(cue.startSec, cue.endSec, cue.text);
         tt.addCue(vttCue);
-      } catch {
+      } catch (e) {
+        console.warn('[playsvideo] VTTCue creation failed:', cue, e);
       }
+    }
+
+    if (shouldSelect) {
+      this.showTextTrack(tt);
     }
 
     const lastCue = msg.cues[msg.cues.length - 1];
@@ -1919,8 +2048,20 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     if (msg.done) {
+      const requestedEnd = this.subtitleRequestedWindowEnd.get(msg.trackIndex);
+      if (requestedEnd !== undefined) {
+        const prev = this.subtitleWindowEnd.get(msg.trackIndex) ?? 0;
+        if (requestedEnd > prev) {
+          this.subtitleWindowEnd.set(msg.trackIndex, requestedEnd);
+        }
+      }
       this.subtitleRequestTimes.delete(msg.trackIndex);
       this.subtitleWindowLoading.delete(msg.trackIndex);
+      this.subtitleRequestedWindowEnd.delete(msg.trackIndex);
+      this._selectOnExtract.delete(msg.trackIndex);
+      if (msg.requestId !== undefined && this._activeSubtitleRequestIds.get(msg.trackIndex) === msg.requestId) {
+        this._activeSubtitleRequestIds.delete(msg.trackIndex);
+      }
 
       const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
       const lang = info?.language ?? '?';
@@ -1997,19 +2138,17 @@ export class PlaysVideoEngine extends EventTarget {
       }
       if (attached.textTrack) {
         attached.textTrack.mode = 'disabled';
-        while (attached.textTrack.cues && attached.textTrack.cues.length > 0) {
-          attached.textTrack.removeCue(attached.textTrack.cues[0]);
-        }
-      } else {
-        attached.element.remove();
-        URL.revokeObjectURL(attached.url);
+        this.clearTextTrackCues(attached.textTrack);
       }
+      attached.element.remove();
+      if (attached.url) URL.revokeObjectURL(attached.url);
     }
     this.attachedSubtitleTracks = keep;
   }
 
   private restartEmbeddedSubtitlesFromPosition(seekTimeSec: number): void {
     if (!this.worker) return;
+    this.cancelPendingSubtitleWork();
     const activeEmbedded = this.attachedSubtitleTracks.filter(
       (a) => a.source === 'embedded' && a.textTrack && a.textTrack.mode !== 'disabled',
     );
@@ -2020,9 +2159,7 @@ export class PlaysVideoEngine extends EventTarget {
 
     for (const attached of activeEmbedded) {
       const tt = attached.textTrack!;
-      while (tt.cues && tt.cues.length > 0) {
-        tt.removeCue(tt.cues[0]);
-      }
+      this.clearTextTrackCues(tt);
       const trackIndex = attached.trackIndex;
       if (trackIndex == null) continue;
       const info = this._subtitleTracks.find((t) => t.index === trackIndex);
@@ -2033,7 +2170,17 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private checkSubtitlePrefetch(): void {
-    if (!this.worker || this.subtitleWindowEnd.size === 0) return;
+    if (!this.worker) return;
+
+    if (this.subtitleWindowEnd.size === 0) return;
+
+    // Don't prefetch subtitles when video buffer is low — segments need the demux
+    const buffered = this.video.buffered;
+    if (buffered.length > 0) {
+      const bufferEnd = buffered.end(buffered.length - 1);
+      if (bufferEnd - this.video.currentTime < 15) return;
+    }
+
     const currentTime = this.video.currentTime;
     const SUBTITLE_WINDOW_SEC = 180;
     const PREFETCH_AHEAD_SEC = 60;
@@ -2055,8 +2202,30 @@ export class PlaysVideoEngine extends EventTarget {
       const endTimeSec = startSec + SUBTITLE_WINDOW_SEC;
       const requestedAtMs = Date.now();
       this.subtitleRequestTimes.set(trackIndex, requestedAtMs);
+      this.subtitleRequestedWindowEnd.set(trackIndex, endTimeSec);
+      const requestId = this.nextSubtitleRequestId(trackIndex);
       mlog(`subtitle prefetch track=${trackIndex} window=[${startSec},${endTimeSec}]`);
-      this.worker.postMessage({ type: 'subtitle', trackIndex, requestedAtMs, seekTimeSec: startSec, endTimeSec });
+      this.worker.postMessage({ type: 'subtitle', trackIndex, requestId, requestedAtMs, seekTimeSec: startSec, endTimeSec });
+    }
+  }
+
+  private showOnlyEmbeddedSubtitleTrack(trackIndex: number): void {
+    const attached = this.attachedSubtitleTracks.find(
+      (a) => a.source === 'embedded' && a.trackIndex === trackIndex && a.textTrack,
+    );
+    if (attached?.textTrack) {
+      this.showTextTrack(attached.textTrack);
+      this.subtitleWindowEnd.delete(trackIndex);
+      this.subtitleWindowLoading.delete(trackIndex);
+      const startSec = this.video.currentTime || 0;
+      const info = this._subtitleTracks.find((t) => t.index === trackIndex);
+      if (info && attached.textTrack.cues && attached.textTrack.cues.length === 0) {
+        this.requestEmbeddedSubtitleTrack(info, startSec);
+      }
+      return;
+    }
+    for (let i = 0; i < this.video.textTracks.length; i++) {
+      this.video.textTracks[i].mode = 'disabled';
     }
   }
 
@@ -2078,16 +2247,63 @@ export class PlaysVideoEngine extends EventTarget {
     const startSec = seekTimeSec ?? 0;
     const endTimeSec = startSec + SUBTITLE_WINDOW_SEC;
     const requestedAtMs = Date.now();
+    const requestId = this.nextSubtitleRequestId(track.index);
     this.subtitleRequestTimes.set(track.index, requestedAtMs);
+    this.subtitleRequestedWindowEnd.set(track.index, endTimeSec);
     this.subtitleWindowLoading.add(track.index);
     mlog(`requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec} window=[${startSec},${endTimeSec}]`);
     this.dispatchSubtitleStatus(
       `Subtitle track ${track.index}: ${track.language ?? '?'} ${track.codec} queued`,
     );
-    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestedAtMs, seekTimeSec, endTimeSec });
+    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestId, requestedAtMs, seekTimeSec, endTimeSec });
+  }
+
+  private nextSubtitleRequestId(trackIndex: number): number {
+    const requestId = ++this._subtitleRequestSeq;
+    this._activeSubtitleRequestIds.set(trackIndex, requestId);
+    return requestId;
+  }
+
+  private cancelPendingSubtitleWork(): void {
+    this.worker?.postMessage({ type: 'subtitle-abort' });
+    this.subtitleWindowLoading.clear();
+    this.subtitleRequestTimes.clear();
+    this.subtitleRequestedWindowEnd.clear();
+    this._activeSubtitleRequestIds.clear();
+  }
+
+  private clearTextTrackCues(track: TextTrack): void {
+    const cues = Array.from(track.cues ?? []);
+    for (const cue of cues) {
+      try {
+        track.removeCue(cue);
+      } catch (e) {
+        console.warn('[playsvideo] Failed to remove cue:', e);
+      }
+    }
+  }
+
+  private hasMatchingCue(
+    track: TextTrack,
+    cue: { startSec: number; endSec: number; text: string },
+  ): boolean {
+    const cues = track.cues;
+    if (!cues) return false;
+    for (let i = 0; i < cues.length; i++) {
+      const existing = cues[i];
+      if (
+        Math.abs(existing.startTime - cue.startSec) < 0.001 &&
+        Math.abs(existing.endTime - cue.endSec) < 0.001 &&
+        existing.text === cue.text
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private handleWorkerSubtitleProgress(msg: WorkerSubtitleProgressMessage): void {
+    if (this._activeSubtitleRequestIds.get(msg.trackIndex) !== msg.requestId) return;
     const info = this._subtitleTracks.find((track) => track.index === msg.trackIndex);
     this.dispatchSubtitleStatus(this.formatSubtitleProgress(info, msg));
   }
@@ -2246,12 +2462,12 @@ function iso639_2to1(code: string): string {
   return map[code] ?? code;
 }
 
-function normalizeSubtitleLanguageCode(code: string): string {
+export function normalizeSubtitleLanguageCode(code: string): string {
   if (code.length === 2) return code;
   return iso639_2to1(code);
 }
 
-function languageLabel(
+export function languageLabel(
   langCode: string,
   trackIndex: number,
   disposition?: { hearingImpaired?: boolean; forced?: boolean },

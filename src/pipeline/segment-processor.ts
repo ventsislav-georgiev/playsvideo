@@ -1,6 +1,6 @@
 import { EncodedPacket, type EncodedPacketSink } from 'mediabunny';
 import type { AudioTranscodeExecutor } from './audio-transcode.js';
-import { collectPacketsInRange } from './demux.js';
+import { collectPacketsInRange, type SegmentBoundaryResolver } from './demux.js';
 import { muxToFmp4 } from './mux.js';
 import { checkAbort } from './source-signal.js';
 import type { PlannedSegment } from './types.js';
@@ -16,6 +16,7 @@ export interface SegmentProcessorConfig {
   doTranscode: boolean;
   transcodeAudio: AudioTranscodeExecutor;
   sourceCodec?: string;
+  resolveSegmentBoundary?: SegmentBoundaryResolver;
   log?: (msg: string) => void;
 }
 
@@ -43,8 +44,18 @@ export async function processSegmentWithAbort(
 ): Promise<SegmentProcessorResult> {
   const log = config.log ?? (() => {});
 
-  const seg = config.plan[index];
-  if (!seg) throw new Error(`Invalid segment index: ${index}`);
+  const plannedSeg = config.plan[index];
+  if (!plannedSeg) throw new Error(`Invalid segment index: ${index}`);
+  let seg = plannedSeg;
+  if (config.resolveSegmentBoundary) {
+    const startSec = await config.resolveSegmentBoundary(index);
+    const endSec = await config.resolveSegmentBoundary(index + 1);
+    seg = {
+      ...plannedSeg,
+      startSec,
+      durationSec: Math.max(1 / 1000, endSec - startSec),
+    };
+  }
   const endSec = seg.startSec + seg.durationSec;
   log(`seg ${index} start range=[${seg.startSec.toFixed(2)},${endSec.toFixed(2)})`);
 
@@ -56,6 +67,16 @@ export async function processSegmentWithAbort(
     startFromKeyframe: true,
   });
   log(`seg ${index} video-collect ${elapsed(tVid)} pkts=${videoPackets.length}`);
+
+  if (videoPackets.length > 0) {
+    const first = videoPackets[0];
+    const last = videoPackets[videoPackets.length - 1];
+    const startDelta = first.timestamp - seg.startSec;
+    const endGapBeforeStretch = endSec - (last.timestamp + last.duration);
+    log(
+      `seg ${index} continuity-video pre startDelta=${startDelta.toFixed(6)} endGap=${endGapBeforeStretch.toFixed(6)}`,
+    );
+  }
 
   // Stretch the last video frame's duration to cover to the segment boundary.
   // Without this, a gap forms between the last frame's end (timestamp+duration)
@@ -78,6 +99,9 @@ export async function processSegmentWithAbort(
     const vidLast = videoPackets[videoPackets.length - 1];
     const vidEnd = vidLast.timestamp + vidLast.duration;
     log(`seg ${index} src-video ts=[${vidFirst.toFixed(4)},${vidEnd.toFixed(4)}] dur=${(vidEnd - vidFirst).toFixed(4)} pkts=${videoPackets.length}`);
+    log(
+      `seg ${index} continuity-video post startDelta=${(vidFirst - seg.startSec).toFixed(6)} endGap=${(endSec - vidEnd).toFixed(6)}`,
+    );
   }
 
   checkAbort(signal);
@@ -95,6 +119,9 @@ export async function processSegmentWithAbort(
     const srcEnd = srcLast.timestamp + srcLast.duration;
     const srcDur = srcEnd - srcFirst;
     log(`seg ${index} src-audio ts=[${srcFirst.toFixed(4)},${srcEnd.toFixed(4)}] dur=${srcDur.toFixed(4)} pktDur=${audioPackets[0].duration.toFixed(6)}`);
+    log(
+      `seg ${index} continuity-audio pre startDelta=${(srcFirst - seg.startSec).toFixed(6)} endGap=${(endSec - srcEnd).toFixed(6)}`,
+    );
   }
 
   checkAbort(signal);
@@ -124,6 +151,9 @@ export async function processSegmentWithAbort(
       const outEnd = outLast.timestamp + outLast.duration;
       const gapToSegEnd = endSec - outEnd;
       log(`seg ${index} out-audio sr=${transcoded.decoderConfig.sampleRate} frames=${audioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${gapToSegEnd.toFixed(4)}`);
+      log(
+        `seg ${index} continuity-audio transcode startDelta=${(outFirst - seg.startSec).toFixed(6)} endGap=${gapToSegEnd.toFixed(6)}`,
+      );
 
     }
     if (!audioDecoderConfig || audioDecoderConfig.codec !== 'mp4a.40.2') {
@@ -147,6 +177,13 @@ export async function processSegmentWithAbort(
       );
       log(`seg ${index} audio-stretch dur=${lastAudio.duration.toFixed(6)}->${stretchedDuration.toFixed(6)} gap=${audioGap.toFixed(6)}`);
     }
+
+    const outFirst = audioPackets[0].timestamp;
+    const outLast = audioPackets[audioPackets.length - 1];
+    const outEnd = outLast.timestamp + outLast.duration;
+    log(
+      `seg ${index} continuity-audio post startDelta=${(outFirst - seg.startSec).toFixed(6)} endGap=${(endSec - outEnd).toFixed(6)}`,
+    );
   }
 
   checkAbort(signal);

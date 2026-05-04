@@ -29,6 +29,8 @@ export interface StreamSubtitleOptions {
   startTimeSec?: number;
   /** If set, stop reading once a cue's start time exceeds this value (seconds). Enables windowed loading. */
   endTimeSec?: number;
+  /** Maximum duration in ms for this extraction run. Stops early to yield demux to segments. */
+  maxDurationMs?: number;
 }
 
 /** Discover subtitle tracks from a demuxed input. Cheap — reads only metadata, no cue extraction. */
@@ -126,7 +128,7 @@ export async function extractSubtitleDataStreaming(
   }
 
   const codec = track.codec ?? 'unknown';
-  const firstBatchSize = options.firstBatchSize ?? 20;
+  const firstBatchSize = options.firstBatchSize ?? 1;
   const batchSize = options.batchSize ?? 200;
 
   const startedAt = performance.now();
@@ -149,6 +151,8 @@ export async function extractSubtitleDataStreaming(
 
   reportProgress('starting', 0);
 
+  // Use index-based seeking (O(log n) via MKV CuePoints) when a start time
+  // is provided, instead of scanning all cues from the beginning (O(n)).
   const cueIterator = options.startTimeSec != null
     ? track.getCuesFrom(options.startTimeSec)
     : track.getCues();
@@ -156,6 +160,9 @@ export async function extractSubtitleDataStreaming(
   let totalRead = 0;
   for await (const cue of cueIterator) {
     if (options.signal?.aborted) break;
+    if (options.maxDurationMs && performance.now() - startedAt > options.maxDurationMs) break;
+    // getCuesFrom may return a few cues from the preceding cluster, skip them
+    if (options.startTimeSec != null && cue.timestamp < options.startTimeSec) continue;
     if (options.endTimeSec != null && cue.timestamp > options.endTimeSec) break;
     pending.push(cue);
     totalRead++;
@@ -173,7 +180,9 @@ export async function extractSubtitleDataStreaming(
     }
   }
 
-  flushBatch(true);
+  if (!options.signal?.aborted) {
+    flushBatch(true);
+  }
 
   let header: string | undefined;
   if ((codec === 'ass' || codec === 'ssa') && !options.signal?.aborted) {

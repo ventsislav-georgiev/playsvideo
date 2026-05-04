@@ -1,5 +1,5 @@
-import { PlaysVideoEngine } from './engine.js';
-import { createCustomControls, type CustomControlsHandle } from './custom-controls.js';
+import { PlaysVideoEngine, languageLabel, normalizeSubtitleLanguageCode } from './engine.js';
+import { createCustomControls, type CustomControlsHandle, type SubtitleTrackMeta } from './custom-controls.js';
 import { bindExternalSubtitlePicker } from './external-subtitle-picker.js';
 
 const fileInput = document.getElementById('file-input') as HTMLInputElement;
@@ -104,11 +104,17 @@ engine.addEventListener('loading', (e) => {
 });
 
 engine.addEventListener('ready', (e) => {
-  const mode = e.detail.passthrough ? 'direct playback' : `${e.detail.totalSegments} segments`;
-  status.textContent = `Ready — ${mode}, ${formatTime(e.detail.durationSec)}`;
+  const { subtitleTracks, passthrough, totalSegments, durationSec } = e.detail;
+  const mode = passthrough ? 'direct playback' : `${totalSegments} segments`;
+  status.textContent = `Ready — ${mode}, ${formatTime(durationSec)}`;
   dropTarget.classList.add('hidden');
   video.style.display = 'block';
   playerActions.style.display = 'flex';
+  storedSubtitleMeta = (subtitleTracks ?? []).map((t: { index: number; language: string; disposition?: { hearingImpaired?: boolean; forced?: boolean } }) => ({
+    index: t.index,
+    label: languageLabel(t.language, t.index, t.disposition),
+    language: normalizeSubtitleLanguageCode(t.language),
+  }));
   videoReady = true;
   applyControlsType();
 });
@@ -125,6 +131,7 @@ engine.addEventListener('error', (e) => {
 let controlsType = localStorage.getItem('pv-controls-type') === 'custom' ? 'custom' : 'stock';
 let customControlsHandle: CustomControlsHandle | null = null;
 let videoReady = false;
+let storedSubtitleMeta: SubtitleTrackMeta[] = [];
 
 function applyControlsType() {
   toggleControlsBtn.textContent = controlsType === 'custom' ? 'Stock controls' : 'Custom controls';
@@ -132,7 +139,7 @@ function applyControlsType() {
   if (controlsType === 'custom') {
     video.removeAttribute('controls');
     if (!customControlsHandle) {
-      customControlsHandle = createCustomControls({ video, container: videoContainer });
+      customControlsHandle = createCustomControls({ video, container: videoContainer, subtitleTracks: storedSubtitleMeta });
     }
   } else {
     video.setAttribute('controls', '');
@@ -145,6 +152,7 @@ function destroyCustomControls() {
   customControlsHandle?.destroy();
   customControlsHandle = null;
   videoReady = false;
+  storedSubtitleMeta = [];
 }
 
 toggleControlsBtn.addEventListener('click', () => {

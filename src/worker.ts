@@ -10,7 +10,13 @@ import {
 } from './pipeline/audio-transcode.js';
 import { audioNeedsTranscode, createBrowserProber } from './pipeline/codec-probe.js';
 import type { DemuxResult } from './pipeline/demux.js';
-import { demuxBlob, demuxUrl, getKeyframeIndex } from './pipeline/demux.js';
+import {
+  createSubtitleInput,
+  createVideoBoundaryResolver,
+  demuxBlob,
+  demuxUrl,
+  getKeyframeIndex,
+} from './pipeline/demux.js';
 import {
   buildMkvKeyframeIndexFromBlob,
   buildMkvKeyframeIndexFromUrl,
@@ -303,11 +309,13 @@ const transcodePool = new TranscodePortPool(localAudioTranscoder);
 
 let demux: DemuxResult | null = null;
 let plan: PlannedSegment[] = [];
+let resolveSegmentBoundary: ReturnType<typeof createVideoBoundaryResolver> | null = null;
 let doTranscode = false;
 let audioDecoderConfig: AudioDecoderConfig | null = null;
 let initSegment: Uint8Array | null = null;
 let currentBlob: Blob | null = null;
 let currentUrl: string | null = null;
+const SEGMENT_TIMEOUT_MS = 30_000;
 const segmentCache = new Map<number, Uint8Array>();
 const segmentTasks = new Map<number, Promise<Uint8Array>>();
 let targetSegDuration = 4;
@@ -318,22 +326,69 @@ let pipelineSetup: Promise<void> = Promise.resolve();
 // Per-segment abort controllers for cancellation
 const segmentAbortControllers = new Map<number, AbortController>();
 
-// --- Subtitle queue: sequential extraction with segment priority ---
-// Subtitles share the same I/O source as segment processing. Running many
-// extractions concurrently starves segment reads and causes frame drops.
-// Queue them and pause while any segment is actively processing.
+// --- Subtitle queue: sequential extraction via dedicated I/O handle ---
+// Subtitles use a separate Input instance (subtitleInput) so they never
+// contend with segment processing. The queue serialises extractions to
+// avoid redundant parallel reads.
 let activeSegmentCount = 0;
 let subtitleInProgress = false;
 let subtitleAbort: AbortController | null = null;
-const subtitleQueue: Array<{ trackIndex: number; requestedAtMs?: number; seekTimeSec?: number; endTimeSec?: number }> = [];
+let subtitleInput: Awaited<ReturnType<typeof createSubtitleInput>> | null = null;
+let subtitleInputPending: ReturnType<typeof createSubtitleInput> | null = null;
+const subtitleQueue: Array<{
+  trackIndex: number;
+  requestId: number;
+  requestedAtMs?: number;
+  seekTimeSec?: number;
+  endTimeSec?: number;
+}> = [];
 
-function enqueueSubtitle(trackIndex: number, requestedAtMs?: number, seekTimeSec?: number, endTimeSec?: number): void {
-  subtitleQueue.push({ trackIndex, requestedAtMs, seekTimeSec, endTimeSec });
+function abortSubtitleWork(reason: string): void {
+  if (subtitleAbort) {
+    subtitleAbort.abort();
+    subtitleAbort = null;
+  }
+  subtitleQueue.length = 0;
+  wlog(reason);
+}
+
+function disposeSubtitleInput(): void {
+  subtitleInputPending = null;
+  if (subtitleInput) {
+    subtitleInput.dispose();
+    subtitleInput = null;
+  }
+}
+
+async function ensureSubtitleInput(): Promise<Awaited<ReturnType<typeof createSubtitleInput>>> {
+  if (subtitleInput) return subtitleInput;
+  if (!subtitleInputPending) {
+    subtitleInputPending = createSubtitleInput(currentBlob, currentUrl);
+  }
+  subtitleInput = await subtitleInputPending;
+  subtitleInputPending = null;
+  return subtitleInput;
+}
+
+function enqueueSubtitle(
+  trackIndex: number,
+  requestId: number,
+  requestedAtMs?: number,
+  seekTimeSec?: number,
+  endTimeSec?: number,
+): void {
+  for (let i = subtitleQueue.length - 1; i >= 0; i--) {
+    if (subtitleQueue[i].trackIndex === trackIndex) {
+      subtitleQueue.splice(i, 1);
+    }
+  }
+  subtitleQueue.push({ trackIndex, requestId, requestedAtMs, seekTimeSec, endTimeSec });
   void drainSubtitleQueue();
 }
 
 async function drainSubtitleQueue(): Promise<void> {
   if (subtitleInProgress) return;
+
   const next = subtitleQueue.shift();
   if (!next) return;
 
@@ -341,7 +396,7 @@ async function drainSubtitleQueue(): Promise<void> {
   const queueDelayMs =
     typeof next.requestedAtMs === 'number' ? Math.max(0, Date.now() - next.requestedAtMs) : 0;
   try {
-    await handleSubtitle(next.trackIndex, queueDelayMs, next.seekTimeSec, next.endTimeSec);
+    await handleSubtitle(next.trackIndex, next.requestId, queueDelayMs, next.seekTimeSec, next.endTimeSec);
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err) });
   } finally {
@@ -412,8 +467,10 @@ self.onmessage = (event: MessageEvent) => {
     prefetchAbort = new AbortController();
     wlog('recv resume — prefetch resumed');
   } else if (msg.type === 'subtitle') {
-    wlog(`recv subtitle trackIndex=${msg.trackIndex} seekTimeSec=${msg.seekTimeSec ?? 'none'} endTimeSec=${msg.endTimeSec ?? 'none'}`);
-    enqueueSubtitle(msg.trackIndex, msg.requestedAtMs, msg.seekTimeSec, msg.endTimeSec);
+    wlog(`recv subtitle trackIndex=${msg.trackIndex} requestId=${msg.requestId} seekTimeSec=${msg.seekTimeSec ?? 'none'} endTimeSec=${msg.endTimeSec ?? 'none'}`);
+    enqueueSubtitle(msg.trackIndex, msg.requestId, msg.requestedAtMs, msg.seekTimeSec, msg.endTimeSec);
+  } else if (msg.type === 'subtitle-abort') {
+    abortSubtitleWork('recv subtitle-abort — subtitle extraction aborted');
   }
 };
 
@@ -438,6 +495,7 @@ function makeProcessorConfig() {
     doTranscode,
     transcodeAudio: transcodePool.hasWorkers() ? transcodePool.transcode : localAudioTranscoder,
     sourceCodec: demux.audioCodec ?? undefined,
+    resolveSegmentBoundary: resolveSegmentBoundary ?? undefined,
     log: wlog,
   };
 }
@@ -483,7 +541,26 @@ async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<U
   const task = (async () => {
     const t0 = performance.now();
     emitSegmentState(index, 'processing');
-    const result = await processSegmentWithAbort(makeProcessorConfig(), index, signal);
+
+    // Timeout prevents indefinite hangs (e.g. ffmpeg.wasm stalling)
+    const timeoutCtrl = new AbortController();
+    const timeoutId = setTimeout(() => timeoutCtrl.abort(), SEGMENT_TIMEOUT_MS);
+    const onExternalAbort = () => timeoutCtrl.abort();
+    signal?.addEventListener('abort', onExternalAbort, { once: true });
+
+    let result;
+    try {
+      result = await processSegmentWithAbort(makeProcessorConfig(), index, timeoutCtrl.signal);
+    } catch (err) {
+      if (!signal?.aborted && timeoutCtrl.signal.aborted) {
+        wlog(`seg ${index} timed out after ${SEGMENT_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', onExternalAbort);
+    }
+
     if (!initSegment && result.initSegment) {
       initSegment = result.initSegment;
       wlog(`init-segment captured size=${initSegment.byteLength}`);
@@ -529,6 +606,7 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
   if (demux) {
     demux.dispose();
   }
+  disposeSubtitleInput();
 
   const tDemux = performance.now();
   demux = await demuxFn();
@@ -579,6 +657,7 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
     durationSec: index.duration,
     targetSegmentDurationSec: targetSegDuration,
   });
+  resolveSegmentBoundary = createVideoBoundaryResolver(demux.videoSink, plan, wlog);
   wlog(`segment-plan done ${elapsed(tPlan)} segments=${plan.length}`);
 
   doTranscode =
@@ -642,6 +721,7 @@ async function handleFileRefresh(file: Blob): Promise<void> {
   if (demux) {
     demux.dispose();
   }
+  disposeSubtitleInput();
   demux = await demuxBlob(file);
   segmentCache.clear();
   segmentTasks.clear();
@@ -725,6 +805,7 @@ async function handleSegment(index: number, signal: AbortSignal) {
 
 function emitSubtitleProgress(
   trackIndex: number,
+  requestId: number,
   progress: SubtitleExtractionProgress,
   queueDelayMs = 0,
 ): void {
@@ -734,6 +815,7 @@ function emitSubtitleProgress(
   const message: WorkerSubtitleProgressMessage = {
     type: 'subtitle-progress',
     trackIndex,
+    requestId,
     phase: progress.phase,
     codec: progress.codec,
     cuesRead: progress.cuesRead,
@@ -743,7 +825,13 @@ function emitSubtitleProgress(
   self.postMessage(message);
 }
 
-async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?: number, endTimeSec?: number) {
+async function handleSubtitle(
+  trackIndex: number,
+  requestId: number,
+  queueDelayMs = 0,
+  seekTimeSec?: number,
+  endTimeSec?: number,
+) {
   if (!demux) {
     self.postMessage({ type: 'error', message: 'No file open' });
     return;
@@ -754,11 +842,13 @@ async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?
 
   const t0 = performance.now();
   let hasSentStart = false;
-  const { codec } = await extractSubtitleDataStreaming(demux.input, trackIndex, {
+  const subInput = await ensureSubtitleInput();
+  const { codec } = await extractSubtitleDataStreaming(subInput, trackIndex, {
     onBatch(cues, done, totalCues, batchCodec) {
       const message: WorkerSubtitleBatchMessage = {
         type: 'subtitle-batch',
         trackIndex,
+        requestId,
         codec: batchCodec,
         cues,
         done,
@@ -767,12 +857,13 @@ async function handleSubtitle(trackIndex: number, queueDelayMs = 0, seekTimeSec?
       self.postMessage(message);
     },
     onProgress(progress) {
-      emitSubtitleProgress(trackIndex, progress, hasSentStart ? 0 : queueDelayMs);
+      emitSubtitleProgress(trackIndex, requestId, progress, hasSentStart ? 0 : queueDelayMs);
       hasSentStart = true;
     },
     signal,
     startTimeSec: seekTimeSec,
     endTimeSec,
+    maxDurationMs: 3000,
   });
 
   subtitleAbort = null;

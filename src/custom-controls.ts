@@ -16,7 +16,12 @@ export interface CustomControlsOptions {
   video: HTMLVideoElement;
   container: HTMLElement;
   subtitleTracks?: SubtitleTrackMeta[];
-  onSubtitleRequest?: (trackIndex: number) => void;
+  onSubtitleRequest?: (
+    trackIndex: number,
+    track?: SubtitleTrackMeta,
+    options?: { notify?: boolean },
+  ) => void;
+  onSubtitleSelectionChange?: (track: SubtitleTrackMeta | null) => void;
   // Phase 2b: Subtitle seeking
   onSubtitleSeek?: (trackIndex: number, targetTimeSec: number) => Promise<void>;
   subtitleSeekingCapability?: {
@@ -31,6 +36,7 @@ export interface CustomControlsOptions {
 export interface CustomControlsHandle {
   destroy(): void;
   updateSubtitleTracks(tracks: SubtitleTrackMeta[]): void;
+  selectSubtitleTrack(trackIndex: number, options?: { notify?: boolean }): boolean;
 }
 
 const SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -398,7 +404,7 @@ function iconBtn(label: string, iconHtml: string, className = 'pv-btn'): HTMLBut
 }
 
 export function createCustomControls(options: CustomControlsOptions): CustomControlsHandle {
-  const { video, container, onSubtitleRequest } = options;
+  const { video, container, onSubtitleRequest, onSubtitleSelectionChange } = options;
   let subtitleMeta: SubtitleTrackMeta[] = options.subtitleTracks ?? [];
   const extractedTracks = new Map<number, TextTrack>();
   injectStyles();
@@ -774,7 +780,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
         const label = trackEvent.track.label;
         if (
           !extractedTracks.has(meta.index) &&
-          (lang === meta.language || label === meta.label)
+          (lang === meta.language && label === meta.label)
         ) {
           extractedTracks.set(meta.index, trackEvent.track);
           if (pendingSubtitleIndex === meta.index) {
@@ -791,6 +797,27 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   };
   video.textTracks.addEventListener('addtrack', onTrackChange);
   video.textTracks.addEventListener('removetrack', onTrackChange);
+
+  const selectSubtitleMeta = (meta: SubtitleTrackMeta, notify = true): boolean => {
+    const existing = extractedTracks.get(meta.index);
+    if (existing) {
+      for (let i = 0; i < video.textTracks.length; i++) {
+        video.textTracks[i].mode = 'disabled';
+      }
+      pendingSubtitleIndex = null;
+      existing.mode = 'showing';
+      if (notify) onSubtitleSelectionChange?.(meta);
+      return true;
+    }
+
+    pendingSubtitleIndex = meta.index;
+    for (let i = 0; i < video.textTracks.length; i++) {
+      video.textTracks[i].mode = 'disabled';
+    }
+    if (notify) onSubtitleSelectionChange?.(meta);
+    onSubtitleRequest?.(meta.index, meta, { notify });
+    return true;
+  };
 
   // Legacy PiP events (for fallback path)
   const onEnterPip = () => {};
@@ -846,7 +873,6 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
   // Seek bar
   const onSeekInput = () => {
     seeking = true;
-    video.currentTime = Number(seekBar.value);
     timeDisplay.textContent = `${formatTime(Number(seekBar.value))} / ${formatTime(safeDuration())}`;
   };
   const onSeekChange = () => {
@@ -920,6 +946,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
                     for (let i = 0; i < video.textTracks.length; i++) {
                       video.textTracks[i].mode = 'disabled';
                     }
+                    onSubtitleSelectionChange?.(null);
                   }),
                 );
 
@@ -931,15 +958,7 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
                     const label = isPending ? `${meta.label} (loading…)` : meta.label;
                     subItems.push(
                       popupItem(label, isShowing, () => {
-                        if (existing) {
-                          for (let i = 0; i < video.textTracks.length; i++) {
-                            video.textTracks[i].mode = 'disabled';
-                          }
-                          existing.mode = 'showing';
-                        } else {
-                          pendingSubtitleIndex = meta.index;
-                          onSubtitleRequest?.(meta.index);
-                        }
+                        selectSubtitleMeta(meta);
                       }),
                     );
                   }
@@ -953,6 +972,11 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
                           video.textTracks[j].mode = 'disabled';
                         }
                         track.mode = 'showing';
+                        onSubtitleSelectionChange?.({
+                          index: i,
+                          label,
+                          language: track.language || '',
+                        });
                       }),
                     );
                   }
@@ -1092,6 +1116,11 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
     },
     updateSubtitleTracks(tracks: SubtitleTrackMeta[]) {
       subtitleMeta = tracks;
+    },
+    selectSubtitleTrack(trackIndex: number, options?: { notify?: boolean }) {
+      const meta = subtitleMeta.find((track) => track.index === trackIndex);
+      if (!meta) return false;
+      return selectSubtitleMeta(meta, options?.notify ?? true);
     },
   };
 }

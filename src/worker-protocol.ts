@@ -20,6 +20,7 @@ export type WorkerSubtitlePhase = 'starting' | 'reading-cues' | 'exporting-text'
 export interface WorkerSubtitleProgressMessage {
   type: 'subtitle-progress';
   trackIndex: number;
+  requestId: number;
   phase: WorkerSubtitlePhase;
   codec: string;
   cuesRead: number;
@@ -31,6 +32,7 @@ export interface WorkerSubtitleProgressMessage {
 export interface WorkerSubtitleBatchMessage {
   type: 'subtitle-batch';
   trackIndex: number;
+  requestId: number;
   codec: string;
   cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
   done: boolean;

@@ -12,7 +12,11 @@ import {
 } from 'mediabunny';
 import type { Source } from '../source.js';
 import { getSubtitleTrackInfos } from './subtitle.js';
-import type { KeyframeEntry, KeyframeIndex, SubtitleTrackInfo } from './types.js';
+import type { KeyframeEntry, KeyframeIndex, PlannedSegment, SubtitleTrackInfo } from './types.js';
+
+const KEYFRAME_LOOKUP_EARLY_SEC = 0.5;
+const KEYFRAME_LOOKUP_LATE_SEC = 0.2;
+const BOUNDARY_ALIGN_EPSILON_SEC = 1 / 1000;
 
 export interface DemuxResult {
   input: Input;
@@ -58,6 +62,22 @@ class SourceAdapter extends MBSource {
 
 export async function demuxSource(source: Source): Promise<DemuxResult> {
   return demuxInput(new Input({ formats: ALL_FORMATS, source: new SourceAdapter(source) }));
+}
+
+/**
+ * Create a lightweight Input handle for subtitle-only access.
+ * Uses its own I/O path so subtitle extraction never contends with
+ * segment processing on the main demux handle.
+ * The returned Input is probed (format detected, subtitle tracks initialised).
+ */
+export async function createSubtitleInput(blob: Blob | null, url: string | null): Promise<Input> {
+  let input: Input;
+  if (blob) input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
+  else if (url) input = new Input({ formats: ALL_FORMATS, source: new UrlSource(url) });
+  else throw new Error('No source provided for subtitle input');
+  // Trigger format probing so subtitle track methods (getCuesFrom, etc.) are available.
+  await input.getSubtitleTracks();
+  return input;
 }
 
 async function demuxInput(input: Input): Promise<DemuxResult> {
@@ -127,17 +147,7 @@ export async function getKeyframeIndex(
   while (packet) {
     const ts = packet.timestamp;
     if (Number.isFinite(ts) && ts >= 0) {
-      // Round-trip validate: ensure getKeyPacket(ts) can actually find this
-      // keyframe. Some demuxers (e.g. Matroska) discover keyframes via
-      // decode-order iteration that per-cluster PTS lookup can't resolve.
-      // If the plan uses such a "phantom" boundary, collectPacketsInRange
-      // backtracks to a much earlier keyframe, creating a large video/audio
-      // start-time mismatch in the muxed fMP4 — which Chrome MSE can't
-      // handle (progressive A/V desync).
-      const found = await videoSink.getKeyPacket(ts, { metadataOnly: true });
-      if (found && Math.abs(found.timestamp - ts) < 0.002) {
-        keyframes.push({ timestamp: ts, sequenceNumber: packet.sequenceNumber });
-      }
+      keyframes.push({ timestamp: ts, sequenceNumber: packet.sequenceNumber });
     }
     const next = await videoSink.getNextKeyPacket(packet, {
       metadataOnly: true,
@@ -147,6 +157,81 @@ export async function getKeyframeIndex(
   }
 
   return { duration, keyframes };
+}
+
+async function resolveActualVideoBoundary(
+  videoSink: EncodedPacketSink,
+  boundarySec: number,
+  nextBoundarySec: number,
+): Promise<number> {
+  if (boundarySec <= BOUNDARY_ALIGN_EPSILON_SEC) return 0;
+
+  let packet = await videoSink.getKeyPacket(boundarySec, { metadataOnly: true });
+  if (!packet) return boundarySec;
+
+  if (boundarySec - packet.timestamp > KEYFRAME_LOOKUP_EARLY_SEC) {
+    let next = await videoSink.getNextKeyPacket(packet, { metadataOnly: true });
+    while (next && next.timestamp <= boundarySec + KEYFRAME_LOOKUP_LATE_SEC) {
+      packet = next;
+      next = await videoSink.getNextKeyPacket(next, { metadataOnly: true });
+    }
+    if (next && boundarySec - packet.timestamp > KEYFRAME_LOOKUP_EARLY_SEC && next.timestamp < nextBoundarySec) {
+      packet = next;
+    }
+  }
+
+  const timestamp = Number(packet.timestamp);
+  return Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : boundarySec;
+}
+
+export type SegmentBoundaryResolver = (boundaryIndex: number) => Promise<number>;
+
+export function createVideoBoundaryResolver(
+  videoSink: EncodedPacketSink,
+  plan: PlannedSegment[],
+  log?: (msg: string) => void,
+): SegmentBoundaryResolver {
+  const cache = new Map<number, Promise<number>>();
+
+  const last = plan[plan.length - 1];
+  const durationSec = last ? last.startSec + last.durationSec : 0;
+
+  return async (boundaryIndex: number) => {
+    if (boundaryIndex <= 0) return 0;
+    if (boundaryIndex >= plan.length) return durationSec;
+
+    const cached = cache.get(boundaryIndex);
+    if (cached) return cached;
+
+    const pending = (async () => {
+      const segment = plan[boundaryIndex];
+      const next = plan[boundaryIndex + 1];
+      const plannedBoundarySec = segment.startSec;
+      const nextBoundarySec = next ? next.startSec : durationSec;
+      const actualBoundarySec = await resolveActualVideoBoundary(
+        videoSink,
+        plannedBoundarySec,
+        nextBoundarySec,
+      );
+
+      const delta = actualBoundarySec - plannedBoundarySec;
+      if (Math.abs(delta) > BOUNDARY_ALIGN_EPSILON_SEC) {
+        log?.(
+          `segment-boundary-align seq=${segment.sequence} ${plannedBoundarySec.toFixed(6)}->${actualBoundarySec.toFixed(6)} delta=${delta.toFixed(6)}`,
+        );
+      }
+
+      return actualBoundarySec;
+    })();
+
+    cache.set(boundaryIndex, pending);
+    try {
+      return await pending;
+    } catch (error) {
+      cache.delete(boundaryIndex);
+      throw error;
+    }
+  };
 }
 
 export async function collectPacketsInRange(
@@ -169,9 +254,14 @@ export async function collectPacketsInRange(
     // handle large A/V start-time mismatches.
     if (packet && startSec - packet.timestamp > 0.5) {
       let next = await sink.getNextKeyPacket(packet);
-      while (next && next.timestamp <= startSec + 0.05) {
+      while (next && next.timestamp <= startSec + 0.2) {
         packet = next;
         next = await sink.getNextKeyPacket(next);
+      }
+      // If still a full GOP back, prefer the next keyframe when it falls
+      // within this segment — avoids collecting double the intended duration.
+      if (next && startSec - packet.timestamp > 0.5 && next.timestamp < endSec) {
+        packet = next;
       }
     }
   } else {
