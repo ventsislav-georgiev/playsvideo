@@ -621,6 +621,7 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
     sourceAudioCodec: demux.audioCodec,
     videoCodec: demux.videoDecoderConfig.codec,
     audioCodec: demux.audioDecoderConfig?.codec ?? null,
+    hasAudioDecoderConfig: demux.audioTrack ? demux.audioDecoderConfig !== null : true,
     durationSec: demux.duration,
     subtitleTracks: demux.subtitleTracks,
   });
@@ -662,7 +663,8 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
 
   doTranscode =
     demux.audioCodec !== null &&
-    audioNeedsTranscode(codecProber, demux.audioCodec, demux.audioDecoderConfig?.codec);
+    (demux.audioDecoderConfig === null ||
+      audioNeedsTranscode(codecProber, demux.audioCodec, demux.audioDecoderConfig.codec));
   if (doTranscode && demux.audioCodec && !transcodePool.hasWorkers()) {
     await ffmpeg.loadForCodec(demux.audioCodec);
   }

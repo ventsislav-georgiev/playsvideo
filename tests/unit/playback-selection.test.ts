@@ -87,6 +87,30 @@ describe('playback-selection', () => {
     expect(result.evaluations[0].diagnostics.map((d) => d.code)).toContain('hls-audio-transcode');
   });
 
+  it('forces hls audio transcode when audio decoder config is missing', () => {
+    const result = evaluatePlaybackOptions({
+      options: [{ mode: 'hls', id: 'hls' }],
+      media: {
+        sourceVideoCodec: 'hevc',
+        sourceAudioCodec: 'aac',
+        videoCodec: 'hev1.1.6.L120.B0',
+        audioCodec: null,
+        hasAudioDecoderConfig: false,
+      },
+      capabilities: {
+        hlsSupported: true,
+        pipelineProbe: ALL_SUPPORTED_PROBE,
+      },
+    });
+
+    expect(result.recommended?.option).toEqual({ mode: 'hls', id: 'hls' });
+    expect(result.evaluations[0].status).toBe('supported');
+    expect(result.evaluations[0].pipelineAudioRequiresTranscode).toBe(true);
+    expect(result.evaluations[0].diagnostics.map((d) => d.code)).toContain(
+      'hls-audio-missing-decoder-config',
+    );
+  });
+
   it('blocks hls when remuxed video is unsupported', () => {
     const result = evaluatePlaybackOptions({
       options: [{ mode: 'hls', id: 'hls' }],

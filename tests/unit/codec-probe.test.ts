@@ -81,11 +81,34 @@ describe('codec-probe', () => {
       return isTypeSupported;
     }
 
+    function mockManagedMediaSource(supported: Set<string>) {
+      const isTypeSupported = vi.fn((mime: string) => supported.has(mime));
+      vi.stubGlobal('MediaSource', undefined);
+      vi.stubGlobal('ManagedMediaSource', { isTypeSupported });
+      return isTypeSupported;
+    }
+
     it('hevc queries correct MIME type', () => {
       const spy = mockMediaSource(new Set(['video/mp4; codecs="hev1.1.6.L93.B0"']));
       const bp = createBrowserProber();
       expect(bp.canPlayVideo('hevc')).toBe(true);
       expect(spy).toHaveBeenCalledWith('video/mp4; codecs="hev1.1.6.L93.B0"');
+    });
+
+    it('uses ManagedMediaSource when classic MediaSource is unavailable', () => {
+      const spy = mockManagedMediaSource(new Set(['video/mp4; codecs="avc1.640028"']));
+      const bp = createBrowserProber();
+      expect(bp.canPlayVideo('avc')).toBe(true);
+      expect(spy).toHaveBeenCalledWith('video/mp4; codecs="avc1.640028"');
+    });
+
+    it('returns false instead of throwing when no MediaSource implementation exists', () => {
+      vi.stubGlobal('MediaSource', undefined);
+      vi.stubGlobal('ManagedMediaSource', undefined);
+      vi.stubGlobal('WebKitMediaSource', undefined);
+      const bp = createBrowserProber();
+      expect(bp.canPlayVideo('avc')).toBe(false);
+      expect(bp.canPlayAudio('aac')).toBe(false);
     });
 
     it('hevc rejected when browser lacks support (Chromium, Firefox)', () => {

@@ -37,17 +37,37 @@ export interface CodecProber {
   canPlayVideo(shortCodec: string, fullCodecString?: string): boolean;
 }
 
+export interface MediaSourceLike {
+  isTypeSupported(mimeType: string): boolean;
+}
+
+type MediaSourceGlobal = typeof globalThis & {
+  ManagedMediaSource?: MediaSourceLike;
+  WebKitMediaSource?: MediaSourceLike;
+};
+
+export function getAvailableMediaSource(): MediaSourceLike | null {
+  const scope = globalThis as MediaSourceGlobal;
+  return scope.ManagedMediaSource ?? scope.MediaSource ?? scope.WebKitMediaSource ?? null;
+}
+
 /**
  * Browser prober — queries MediaSource.isTypeSupported() with result caching.
  * Create once at module level in the worker.
  */
-export function createBrowserProber(): CodecProber {
+export function createBrowserProber(mediaSource: MediaSourceLike | null = getAvailableMediaSource()): CodecProber {
   const cache = new Map<string, boolean>();
 
   function isSupported(mime: string): boolean {
+    if (!mediaSource) return false;
     const cached = cache.get(mime);
     if (cached !== undefined) return cached;
-    const result = MediaSource.isTypeSupported(mime);
+    let result = false;
+    try {
+      result = mediaSource.isTypeSupported(mime);
+    } catch {
+      result = false;
+    }
     cache.set(mime, result);
     return result;
   }

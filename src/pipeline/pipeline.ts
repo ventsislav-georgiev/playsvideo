@@ -46,7 +46,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
     const doTranscode =
       demux.audioCodec !== null &&
-      audioNeedsTranscode(prober, demux.audioCodec, demux.audioDecoderConfig?.codec);
+      (demux.audioDecoderConfig === null ||
+        audioNeedsTranscode(prober, demux.audioCodec, demux.audioDecoderConfig.codec));
     const outputAudioCodec = doTranscode ? 'aac' : (demux.audioCodec ?? 'aac');
 
     // For transcoded audio, we'll build a new AudioDecoderConfig from the AAC output.

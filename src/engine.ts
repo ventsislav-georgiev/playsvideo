@@ -1130,6 +1130,7 @@ export class PlaysVideoEngine extends EventTarget {
         sourceAudioCodec: msg.sourceAudioCodec ?? null,
         videoCodec: msg.videoCodec ?? null,
         audioCodec: msg.audioCodec ?? null,
+        hasAudioDecoderConfig: msg.hasAudioDecoderConfig !== false,
       };
       const evaluation = this.evaluateInitialPlayback(media);
       this.logPlaybackDiagnostics('playback selection', evaluation);
@@ -1370,6 +1371,7 @@ export class PlaysVideoEngine extends EventTarget {
         sourceAudioCodec: demux.audioCodec,
         videoCodec: demux.videoDecoderConfig.codec,
         audioCodec: demux.audioDecoderConfig?.codec ?? null,
+        hasAudioDecoderConfig: demux.audioTrack ? demux.audioDecoderConfig !== null : true,
       };
       const evaluation = this.evaluateSourcePlayback(media);
       this.logPlaybackDiagnostics('source playback selection', evaluation);
@@ -1756,10 +1758,17 @@ export class PlaysVideoEngine extends EventTarget {
       }
     }
 
+    const selectedMediaSource = typeof Hls.getMediaSource === 'function' ? Hls.getMediaSource() : undefined;
+    const managedMediaSource = (globalThis as typeof globalThis & { ManagedMediaSource?: typeof MediaSource }).ManagedMediaSource;
+    if (selectedMediaSource && managedMediaSource && selectedMediaSource === managedMediaSource) {
+      this.video.disableRemotePlayback = true;
+    }
+
     this.hls = new Hls({
       pLoader: PipelinePlaylistLoader as any,
       fLoader: PipelineFragmentLoader as any,
       enableWorker: false,
+      preferManagedMediaSource: true,
       maxBufferLength: 15,
       maxMaxBufferLength: 30,
       backBufferLength: 30,
@@ -2291,10 +2300,11 @@ export class PlaysVideoEngine extends EventTarget {
     if (!cues) return false;
     for (let i = 0; i < cues.length; i++) {
       const existing = cues[i];
+      const existingText = 'text' in existing ? String(existing.text) : null;
       if (
         Math.abs(existing.startTime - cue.startSec) < 0.001 &&
         Math.abs(existing.endTime - cue.endSec) < 0.001 &&
-        existing.text === cue.text
+        existingText === cue.text
       ) {
         return true;
       }

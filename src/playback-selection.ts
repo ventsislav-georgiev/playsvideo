@@ -1,5 +1,5 @@
 import Hls from 'hls.js/light';
-import { createBrowserProber } from './pipeline/codec-probe.js';
+import { createBrowserProber, getAvailableMediaSource, type MediaSourceLike } from './pipeline/codec-probe.js';
 
 export type PlaybackMode = 'hls' | 'direct-url' | 'direct-bytes';
 
@@ -31,6 +31,9 @@ export interface PlaybackMediaMetadata {
    */
   videoCodec: string | null;
   audioCodec: string | null;
+
+  /** Whether demux supplied decoder metadata required for fMP4 audio passthrough. */
+  hasAudioDecoderConfig?: boolean;
 }
 
 export type CanPlayTypeResult = '' | 'maybe' | 'probably';
@@ -49,6 +52,7 @@ export interface PlaybackCapabilityContext {
 export interface BrowserPlaybackCapabilityOptions {
   hlsSupported?: boolean;
   pipelineProbe?: PipelinePlaybackProbe;
+  mediaSource?: MediaSourceLike | null;
 }
 
 export type PlaybackDiagnosticCode =
@@ -63,6 +67,7 @@ export type PlaybackDiagnosticCode =
   | 'hls-video-supported'
   | 'hls-video-unsupported'
   | 'hls-audio-supported'
+  | 'hls-audio-missing-decoder-config'
   | 'hls-audio-transcode'
   | 'hls-no-audio-track'
   | 'selected-direct'
@@ -118,10 +123,12 @@ export function createBrowserPlaybackCapabilities(
   video: Pick<HTMLVideoElement, 'canPlayType'>,
   options: BrowserPlaybackCapabilityOptions = {},
 ): PlaybackCapabilityContext {
+  const hlsMediaSource = typeof Hls.getMediaSource === 'function' ? Hls.getMediaSource() : undefined;
+  const mediaSource = options.mediaSource ?? hlsMediaSource ?? getAvailableMediaSource();
   return {
     canPlayType: (mimeType) => normalizeCanPlayType(video.canPlayType(mimeType)),
     hlsSupported: options.hlsSupported ?? Hls.isSupported(),
-    pipelineProbe: options.pipelineProbe ?? createBrowserProber(),
+    pipelineProbe: options.pipelineProbe ?? createBrowserProber(mediaSource ?? null),
   };
 }
 
@@ -285,6 +292,18 @@ function evaluateHlsOption(
       pipelineVideoSupported,
       pipelineAudioSupported: null,
       pipelineAudioRequiresTranscode: false,
+    });
+  }
+
+  if (media.hasAudioDecoderConfig === false) {
+    diagnostics.push({
+      code: 'hls-audio-missing-decoder-config',
+      message: 'The remux/HLS path needs audio decoder metadata for passthrough; audio will be transcoded to AAC.',
+    });
+    return makeEvaluation(option, 'supported', diagnostics, {
+      pipelineVideoSupported,
+      pipelineAudioSupported: false,
+      pipelineAudioRequiresTranscode: true,
     });
   }
 
