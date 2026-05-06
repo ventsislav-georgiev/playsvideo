@@ -19,7 +19,11 @@ import {
   type PlaybackOption,
   type PlaybackOptionEvaluation,
 } from './playback-selection.js';
-import { createLocalAudioTranscoder, makeAacDecoderConfig } from './pipeline/audio-transcode.js';
+import {
+  createLocalAudioTranscoder,
+  isAudioTranscodeInputSupported,
+  makeAacDecoderConfig,
+} from './pipeline/audio-transcode.js';
 import type { DemuxResult, SegmentBoundaryResolver } from './pipeline/demux.js';
 import { generateVodPlaylist } from './pipeline/playlist.js';
 import { buildSegmentPlan } from './pipeline/segment-plan.js';
@@ -125,6 +129,20 @@ interface BufferedGap {
   gap: number;
 }
 
+interface SegmentDeliveryDebug {
+  index: number;
+  sizeBytes: number;
+  deliveredAtMs: number;
+  fromCache: boolean;
+}
+
+const MEDIA_ERROR_CODES: Record<number, string> = {
+  1: 'MEDIA_ERR_ABORTED',
+  2: 'MEDIA_ERR_NETWORK',
+  3: 'MEDIA_ERR_DECODE',
+  4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+};
+
 export interface SegmentStateDetail {
   segments: SegmentState[];
 }
@@ -140,6 +158,11 @@ export interface EngineOptions {
   embeddedSubtitlePolicy?: EmbeddedSubtitlePolicy;
 }
 
+export interface LoadStartOptions {
+  /** Initial playback position in seconds. Used to start HLS loading at the resume target. */
+  startTimeSec?: number;
+}
+
 export interface LoadWithOptionsInput {
   source: Source;
   options: PlaybackOption[];
@@ -147,6 +170,7 @@ export interface LoadWithOptionsInput {
   targetSegmentDuration?: number;
   preferenceOrder?: PlaybackMode[];
   playbackPolicy?: PlaybackPolicy;
+  startTimeSec?: number;
 }
 
 export interface ExternalSubtitleOptions {
@@ -176,7 +200,6 @@ export interface SubtitleSeekingResult {
   /** Time spent seeking (milliseconds) */
   elapsedMs: number;
 }
-
 
 export interface CodecDescriptor {
   short: string | null;
@@ -226,6 +249,13 @@ function defaultTranscodeWorkerCount(): number {
   return Math.max(1, Math.min(2, concurrency - 1));
 }
 
+function describeMediaError(error: MediaError | null): string {
+  if (!error) return 'none';
+  const codeName = MEDIA_ERROR_CODES[error.code] ?? `UNKNOWN_${error.code}`;
+  const message = error.message ? ` message=${error.message}` : '';
+  return `${codeName}(${error.code})${message}`;
+}
+
 export class PlaysVideoEngine extends EventTarget {
   readonly video: HTMLVideoElement;
   readonly options: Required<EngineOptions>;
@@ -234,6 +264,7 @@ export class PlaysVideoEngine extends EventTarget {
   private _transcodeWorkerStates: WasmWorkerState[] = [];
   private _segmentStates = new Map<number, SegmentState>();
   private _lastBufferedGapsBySegment = new Map<number, BufferedGap[]>();
+  private _recentSegmentDeliveries: SegmentDeliveryDebug[] = [];
   private hls: Hls | null = null;
 
   // Pending segment requests from hls.js custom loader
@@ -306,6 +337,8 @@ export class PlaysVideoEngine extends EventTarget {
   private _sourcePlaybackPolicy: PlaybackPolicy = 'auto';
   private _lastInternalErrorMessage: string | null = null;
   private _lastInternalErrorAt = 0;
+  private _initialStartTimeSec: number | null = null;
+  private _hlsLoadStarted = false;
 
   private _onVideoPause = (): void => {
     if (this.hls) {
@@ -323,8 +356,9 @@ export class PlaysVideoEngine extends EventTarget {
 
   private _onVideoPlay = (): void => {
     if (this.hls) {
-      this.hls.startLoad(-1);
-      mlog('video play → hls.startLoad');
+      const startPosition = this.consumeHlsStartPosition();
+      this.hls.startLoad(startPosition);
+      mlog(`video play → hls.startLoad(${startPosition.toFixed(3)})`);
     }
     this.worker?.postMessage({ type: 'resume' });
   };
@@ -403,11 +437,12 @@ export class PlaysVideoEngine extends EventTarget {
     this.video.addEventListener('timeupdate', () => this.checkSubtitlePrefetch());
   }
 
-  loadFile(file: File, opts?: { keyframeIndex?: KeyframeIndex }): void {
+  loadFile(file: File, opts?: { keyframeIndex?: KeyframeIndex } & LoadStartOptions): void {
     this.reset({ file });
     this._pendingFileType = file.type || null;
     this._blobUrl = URL.createObjectURL(file);
     this._keyframeIndex = opts?.keyframeIndex ?? null;
+    this.setInitialStartTime(opts?.startTimeSec);
     this.createWorker();
     this.worker!.postMessage({ type: 'open', file });
     mlog(`open file=${file.name} size=${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`);
@@ -427,10 +462,17 @@ export class PlaysVideoEngine extends EventTarget {
     mlog(`refresh file=${file.name} size=${(file.size / 1024 / 1024).toFixed(1)}MB`);
   }
 
-  loadUrl(url: string, opts?: { keyframeIndex?: KeyframeIndex }): void {
+  loadUrl(url: string, opts?: { keyframeIndex?: KeyframeIndex } & LoadStartOptions): void {
     this.reset({ url });
     this._keyframeIndex = opts?.keyframeIndex ?? null;
-    this._sourcePlaybackOptions = null;
+    this.setInitialStartTime(opts?.startTimeSec);
+    const directMimeType = inferDirectUrlMimeType(url);
+    this._sourcePlaybackOptions = directMimeType
+      ? [
+          { mode: 'direct-url', mimeType: directMimeType, url },
+          { mode: 'hls' },
+        ]
+      : null;
     this._sourcePreferenceOrder = null;
     this._sourcePlaybackPolicy = 'auto';
     this.createWorker();
@@ -483,10 +525,12 @@ export class PlaysVideoEngine extends EventTarget {
       keyframeIndex?: KeyframeIndex;
       ffmpeg?: FfmpegRunner;
       targetSegmentDuration?: number;
+      startTimeSec?: number;
     },
   ): void {
     this.reset({});
     this._keyframeIndex = opts?.keyframeIndex ?? null;
+    this.setInitialStartTime(opts?.startTimeSec);
     this._sourcePlaybackOptions = null;
     this._sourcePreferenceOrder = null;
     this._sourcePlaybackPolicy = 'auto';
@@ -504,6 +548,7 @@ export class PlaysVideoEngine extends EventTarget {
   loadWithOptions(input: LoadWithOptionsInput): void {
     this.reset({});
     this._keyframeIndex = null;
+    this.setInitialStartTime(input.startTimeSec);
     this._source = input.source;
     this._sourcePlan = [];
     this._sourceBoundaryResolver = null;
@@ -673,14 +718,10 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     try {
-      const result = await seekSubtitleInMkv(
-        this._sourceDemux.input,
-        options.trackIndex,
-        {
-          targetTimeSec: options.targetTimeSec,
-          signal: options.signal,
-        }
-      );
+      const result = await seekSubtitleInMkv(this._sourceDemux.input, options.trackIndex, {
+        targetTimeSec: options.targetTimeSec,
+        signal: options.signal,
+      });
       return result;
     } catch (error) {
       mlog(`Subtitle seeking failed: ${String(error)}`);
@@ -771,6 +812,8 @@ export class PlaysVideoEngine extends EventTarget {
     this._segmentStates.clear();
     this._lastInternalErrorMessage = null;
     this._lastInternalErrorAt = 0;
+    this._initialStartTimeSec = null;
+    this._hlsLoadStarted = false;
     this.dispatchSegmentStateChange();
   }
 
@@ -838,6 +881,19 @@ export class PlaysVideoEngine extends EventTarget {
       this.recordInternalError(patch.lastError);
     }
     this.dispatchWorkerStateChange();
+  }
+
+  private setInitialStartTime(value: number | undefined): void {
+    this._initialStartTimeSec = Number.isFinite(value) && value! > 0 ? Math.max(0, value!) : null;
+    this._hlsLoadStarted = false;
+  }
+
+  private consumeHlsStartPosition(): number {
+    if (this._hlsLoadStarted) return -1;
+    this._hlsLoadStarted = true;
+    const start = this._initialStartTimeSec;
+    this._initialStartTimeSec = null;
+    return start !== null ? start : -1;
   }
 
   private noteSegmentState(
@@ -936,10 +992,59 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     const timeline = phaseParts.length > 0 ? phaseParts.join(' ') : 'timeline=missing';
-    const latency = state.latencyMs !== null ? `latency=${state.latencyMs.toFixed(1)}ms` : 'latency=?';
+    const latency =
+      state.latencyMs !== null ? `latency=${state.latencyMs.toFixed(1)}ms` : 'latency=?';
     const size = state.sizeBytes !== null ? `size=${state.sizeBytes}` : 'size=?';
     const total = totalMs !== null ? `total=${totalMs.toFixed(1)}ms` : 'total=?';
     return `${latency} ${size} ${total} ${timeline}`;
+  }
+
+  private noteSegmentDeliveredForDebug(index: number, sizeBytes: number, fromCache: boolean): void {
+    this._recentSegmentDeliveries.push({
+      index,
+      sizeBytes,
+      deliveredAtMs: performance.now(),
+      fromCache,
+    });
+    if (this._recentSegmentDeliveries.length > 12) {
+      this._recentSegmentDeliveries.splice(0, this._recentSegmentDeliveries.length - 12);
+    }
+  }
+
+  private debugPlaybackSnapshot(fragSn?: number | string | null): string {
+    const buffered: string[] = [];
+    const ranges = this.video.buffered;
+    for (let i = 0; i < ranges.length; i++) {
+      buffered.push(`[${ranges.start(i).toFixed(3)},${ranges.end(i).toFixed(3)}]`);
+    }
+
+    const deliveries = this._recentSegmentDeliveries
+      .map((entry) => {
+        const ageMs = Math.max(0, performance.now() - entry.deliveredAtMs).toFixed(0);
+        return `${entry.index}:${entry.sizeBytes}${entry.fromCache ? ':cache' : ''}@-${ageMs}ms`;
+      })
+      .join(' ');
+    const sn = typeof fragSn === 'number' ? fragSn : Number.NaN;
+    const nearby = Number.isFinite(sn)
+      ? [sn - 1, sn, sn + 1]
+          .filter((idx) => idx >= 0)
+          .map((idx) => `seg${idx}{${this.getSegmentContinuitySnapshot(idx)}}`)
+          .join(' ')
+      : '';
+
+    return [
+      `t=${this.video.currentTime.toFixed(3)}`,
+      `ready=${this.video.readyState}`,
+      `network=${this.video.networkState}`,
+      `paused=${this.video.paused}`,
+      `buffered=${buffered.join(' ') || 'none'}`,
+      `pending=${this.pendingSegments.size}`,
+      `prefetch=${this._sourcePrefetchIndex ?? 'none'}`,
+      `recent=${deliveries || 'none'}`,
+      nearby,
+    ]
+      .filter(Boolean)
+      .join(' ');
   }
 
   private recordInternalError(message: string): string {
@@ -982,6 +1087,8 @@ export class PlaysVideoEngine extends EventTarget {
           { mode: 'direct-bytes', mimeType: this._pendingFileType, url: this._blobUrl } as const,
           { mode: 'hls' } as const,
         ]
+      : this._sourcePlaybackOptions
+        ? this._sourcePlaybackOptions
       : ([{ mode: 'hls' }] as const);
 
     return evaluatePlaybackOptions({
@@ -1131,28 +1238,33 @@ export class PlaysVideoEngine extends EventTarget {
         videoCodec: msg.videoCodec ?? null,
         audioCodec: msg.audioCodec ?? null,
         hasAudioDecoderConfig: msg.hasAudioDecoderConfig !== false,
+        hasAudioTrack: msg.hasAudioTrack === true,
       };
       const evaluation = this.evaluateInitialPlayback(media);
       this.logPlaybackDiagnostics('playback selection', evaluation);
       this.dispatchPlaybackDecision(media, evaluation);
       this._subtitleTracks = msg.subtitleTracks ?? [];
       const blobUrl = this._blobUrl;
-      const usePassthrough =
-        evaluation.recommended?.option.mode === 'direct-bytes' && blobUrl !== null;
+      const selectedOption = evaluation.recommended?.option ?? null;
+      const directPassthroughUrl =
+        selectedOption?.mode === 'direct-bytes' && blobUrl !== null
+          ? blobUrl
+          : selectedOption?.mode === 'direct-url' && selectedOption.url
+            ? selectedOption.url
+            : null;
+      const usePassthrough = directPassthroughUrl !== null;
       this._codecPath = this.makeCodecPathFromSource(
         media,
         usePassthrough ? 'passthrough' : 'pipeline',
       );
 
-      if (usePassthrough && blobUrl) {
+      if (usePassthrough && directPassthroughUrl) {
         mlog(`passthrough: selected direct playback codecs=${msg.videoCodec}/${msg.audioCodec}`);
-        this.startPassthrough(blobUrl);
+        this.startPassthrough(directPassthroughUrl);
         this.worker!.postMessage({ type: 'passthrough-pipeline' });
 
         if (this._subtitleTracks.length > 0) {
-          this.dispatchSubtitleStatus(
-            `${this._subtitleTracks.length} subtitle track(s) available`,
-          );
+          this.dispatchSubtitleStatus(`${this._subtitleTracks.length} subtitle track(s) available`);
         } else {
           this.dispatchSubtitleStatus('No embedded subtitles');
         }
@@ -1213,9 +1325,7 @@ export class PlaysVideoEngine extends EventTarget {
 
       // On-demand: advertise availability without extracting
       if (this._subtitleTracks.length > 0) {
-        this.dispatchSubtitleStatus(
-          `${this._subtitleTracks.length} subtitle track(s) available`,
-        );
+        this.dispatchSubtitleStatus(`${this._subtitleTracks.length} subtitle track(s) available`);
       } else {
         this.dispatchSubtitleStatus('No embedded subtitles');
       }
@@ -1331,7 +1441,9 @@ export class PlaysVideoEngine extends EventTarget {
 
   private async startSourcePipeline(source: Source): Promise<void> {
     try {
-      const { createVideoBoundaryResolver, demuxSource, getKeyframeIndex } = await import('./pipeline/demux.js');
+      const { createVideoBoundaryResolver, demuxSource, getKeyframeIndex } = await import(
+        './pipeline/demux.js'
+      );
       const { buildMkvKeyframeIndexFromSource } = await import('./pipeline/mkv-keyframe-index.js');
 
       mlog('source pipeline: demuxing');
@@ -1372,6 +1484,7 @@ export class PlaysVideoEngine extends EventTarget {
         videoCodec: demux.videoDecoderConfig.codec,
         audioCodec: demux.audioDecoderConfig?.codec ?? null,
         hasAudioDecoderConfig: demux.audioTrack ? demux.audioDecoderConfig !== null : true,
+        hasAudioTrack: demux.audioTrack !== null,
       };
       const evaluation = this.evaluateSourcePlayback(media);
       this.logPlaybackDiagnostics('source playback selection', evaluation);
@@ -1413,6 +1526,24 @@ export class PlaysVideoEngine extends EventTarget {
         );
       }
       this._sourceDoTranscode = hlsEvaluation.pipelineAudioRequiresTranscode === true;
+      if (demux.audioTrack && !demux.audioCodec) {
+        throw new Error(
+          `Unsupported audio track codec: ${demux.audioInternalCodecId ?? 'unknown'}; cannot transcode without a recognized source codec`,
+        );
+      }
+      if (
+        this._sourceDoTranscode &&
+        demux.audioCodec &&
+        !isAudioTranscodeInputSupported(demux.audioCodec)
+      ) {
+        throw new Error(`Unsupported audio transcode source codec: ${demux.audioCodec}`);
+      }
+      if (this._sourceDoTranscode && demux.audioCodec) {
+        if (!this._sourceFfmpeg) {
+          this._sourceFfmpeg = new WasmFfmpegRunner();
+        }
+        await this._sourceFfmpeg.loadForCodec?.(demux.audioCodec);
+      }
       this._sourceAudioDecoderConfig = this._sourceDoTranscode
         ? makeAacDecoderConfig(demux.audioDecoderConfig)
         : demux.audioDecoderConfig;
@@ -1423,6 +1554,7 @@ export class PlaysVideoEngine extends EventTarget {
 
       // Pre-process segment 0
       const seg0Result = await processSegmentWithAbort(this.makeSourceProcessorConfig(), 0);
+      this._sourceAudioDecoderConfig = seg0Result.audioDecoderConfig;
       if (seg0Result.initSegment) {
         this._sourceInitSegment = seg0Result.initSegment;
       }
@@ -1464,7 +1596,6 @@ export class PlaysVideoEngine extends EventTarget {
         }),
       );
 
-      void this.extractEmbeddedSubtitlesFromDemux(demux);
       this.startHls();
     } catch (err) {
       this.failPlayback(String(err));
@@ -1482,6 +1613,7 @@ export class PlaysVideoEngine extends EventTarget {
       videoCodec: demux.videoCodec,
       audioCodec: demux.audioCodec,
       videoDecoderConfig: demux.videoDecoderConfig,
+      sourceAudioDecoderConfig: demux.audioDecoderConfig,
       audioDecoderConfig: this._sourceAudioDecoderConfig,
       plan: this._sourcePlan,
       doTranscode: this._sourceDoTranscode,
@@ -1500,6 +1632,8 @@ export class PlaysVideoEngine extends EventTarget {
     const cached = this._sourcePrefetchCache.get(index);
     if (cached) {
       this._sourcePrefetchCache.delete(index);
+      this.noteSegmentDeliveredForDebug(index, cached.byteLength, true);
+      mlog(`source seg ${index} cache-hit size=${cached.byteLength}`);
       this.prefetchNextSourceSegment(index);
       return cached;
     }
@@ -1538,6 +1672,8 @@ export class PlaysVideoEngine extends EventTarget {
       result.mediaData.byteOffset,
       result.mediaData.byteOffset + result.mediaData.byteLength,
     );
+    this.noteSegmentDeliveredForDebug(index, data.byteLength, false);
+    mlog(`source seg ${index} delivered size=${data.byteLength}`);
 
     this.prefetchNextSourceSegment(index);
 
@@ -1758,17 +1894,14 @@ export class PlaysVideoEngine extends EventTarget {
       }
     }
 
-    const selectedMediaSource = typeof Hls.getMediaSource === 'function' ? Hls.getMediaSource() : undefined;
-    const managedMediaSource = (globalThis as typeof globalThis & { ManagedMediaSource?: typeof MediaSource }).ManagedMediaSource;
-    if (selectedMediaSource && managedMediaSource && selectedMediaSource === managedMediaSource) {
-      this.video.disableRemotePlayback = true;
-    }
+    this.video.disableRemotePlayback = true;
 
     this.hls = new Hls({
       pLoader: PipelinePlaylistLoader as any,
       fLoader: PipelineFragmentLoader as any,
       enableWorker: false,
-      preferManagedMediaSource: true,
+      autoStartLoad: false,
+      preferManagedMediaSource: false,
       maxBufferLength: 15,
       maxMaxBufferLength: 30,
       backBufferLength: 30,
@@ -1789,12 +1922,7 @@ export class PlaysVideoEngine extends EventTarget {
       mlog(`hls FRAG_LOADING sn=${data.frag.sn} url=${data.frag.relurl}`);
     });
 
-    this.hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
-      mlog(`hls FRAG_LOADED sn=${data.frag.sn} size=${data.frag.stats.loaded}`);
-    });
-
     this.hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
-      mlog(`hls FRAG_BUFFERED sn=${data.frag.sn}`);
       const sb = this.video.buffered;
       const ranges: string[] = [];
       const gaps: BufferedGap[] = [];
@@ -1812,7 +1940,6 @@ export class PlaysVideoEngine extends EventTarget {
           }
         }
       }
-      mlog(`hls buffered ${ranges.join(' ')}`);
       const segmentIndex = Number(data.frag.sn);
       const previous = this._lastBufferedGapsBySegment.get(segmentIndex) ?? [];
       const changed =
@@ -1829,7 +1956,9 @@ export class PlaysVideoEngine extends EventTarget {
       if (changed) {
         this._lastBufferedGapsBySegment.set(segmentIndex, gaps);
         if (gaps.length === 0 && previous.length > 0) {
-          mlog(`hls gap-status sn=${segmentIndex} cleared ${this.getSegmentContinuitySnapshot(segmentIndex)}`);
+          mlog(
+            `hls gap-status sn=${segmentIndex} cleared ${this.getSegmentContinuitySnapshot(segmentIndex)}`,
+          );
         } else if (gaps.length > 0) {
           const summary = gaps
             .map((gap) => `[${gap.start.toFixed(3)},${gap.end.toFixed(3)})=${gap.gap.toFixed(3)}s`)
@@ -1839,24 +1968,14 @@ export class PlaysVideoEngine extends EventTarget {
           );
         }
       }
-      const q = this.video.getVideoPlaybackQuality?.();
-      if (q) {
-        mlog(`hls playback-quality total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames} t=${this.video.currentTime.toFixed(3)}`);
-      }
-    });
-
-    this.hls.on(Hls.Events.BUFFER_APPENDING, (_evt, data) => {
-      const bytes = data.data?.byteLength ?? 0;
-      mlog(
-        `hls BUFFER_APPENDING type=${data.type} sn=${data.frag.sn} bytes=${bytes}`,
-      );
     });
 
     this.hls.on(Hls.Events.ERROR, (_evt, data) => {
       const underlyingMessage =
         data.error?.message ?? data.reason ?? data.response?.text ?? data.err?.message ?? null;
+      const fragSn = data.frag?.sn ?? null;
       mlog(
-        `hls ERROR fatal=${data.fatal} type=${data.type} details=${data.details}${underlyingMessage ? ` message=${underlyingMessage}` : ''}`,
+        `hls ERROR fatal=${data.fatal} type=${data.type} details=${data.details} sn=${fragSn ?? 'none'}${underlyingMessage ? ` message=${underlyingMessage}` : ''} mediaError=${describeMediaError(this.video.error)} snapshot=${this.debugPlaybackSnapshot(fragSn)}`,
       );
       if (data.fatal) {
         console.error('hls.js fatal error:', data);
@@ -1877,21 +1996,23 @@ export class PlaysVideoEngine extends EventTarget {
     this.video.addEventListener('pause', this._onVideoPause);
     this.video.addEventListener('play', this._onVideoPlay);
     this.video.addEventListener('seeked', this._onVideoSeeked);
+    this.video.addEventListener('error', () => {
+      mlog(
+        `video.error ${describeMediaError(this.video.error)} snapshot=${this.debugPlaybackSnapshot()}`,
+      );
+    });
 
-    for (const evt of ['waiting', 'stalled', 'playing'] as const) {
+    for (const evt of ['waiting', 'playing', 'emptied', 'abort'] as const) {
       this.video.addEventListener(evt, () => {
         const t = this.video.currentTime.toFixed(3);
         const sb = this.video.buffered;
-        const bufEnd =
-          sb.length > 0 ? sb.end(sb.length - 1).toFixed(3) : 'none';
+        const bufEnd = sb.length > 0 ? sb.end(sb.length - 1).toFixed(3) : 'none';
         const ahead =
-          sb.length > 0
-            ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1)
-            : '?';
+          sb.length > 0 ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1) : '?';
         const q = this.video.getVideoPlaybackQuality?.();
         const dropped = q ? q.droppedVideoFrames : '?';
         mlog(
-          `video.${evt} t=${t} bufEnd=${bufEnd} ahead=${ahead}s dropped=${dropped} readyState=${this.video.readyState}`,
+          `video.${evt} t=${t} bufEnd=${bufEnd} ahead=${ahead}s dropped=${dropped} readyState=${this.video.readyState} mediaError=${describeMediaError(this.video.error)}`,
         );
       });
     }
@@ -1919,7 +2040,9 @@ export class PlaysVideoEngine extends EventTarget {
             for (let i = 0; i < sb.length; i++) {
               if (ct < sb.start(i) && sb.start(i) - ct < 1) {
                 const target = sb.start(i) + 0.01;
-                mlog(`stall-recovery: nudge ${ct.toFixed(3)}->${target.toFixed(3)} (gap=${(sb.start(i) - ct).toFixed(3)})`);
+                mlog(
+                  `stall-recovery: nudge ${ct.toFixed(3)}->${target.toFixed(3)} (gap=${(sb.start(i) - ct).toFixed(3)})`,
+                );
                 this.video.currentTime = target;
                 stallCount = 0;
                 return;
@@ -1936,29 +2059,12 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.video.addEventListener('playing', startStallCheck);
     this.video.addEventListener('pause', () => {
-      if (stallCheckTimer) { clearInterval(stallCheckTimer); stallCheckTimer = null; }
+      if (stallCheckTimer) {
+        clearInterval(stallCheckTimer);
+        stallCheckTimer = null;
+      }
       stallCount = 0;
     });
-
-    let lastFrameTime = performance.now();
-    const jankThreshold = 50;
-    const checkJank = () => {
-      if (this.video.paused && !this.video.seeking) {
-        lastFrameTime = performance.now();
-        requestAnimationFrame(checkJank);
-        return;
-      }
-      const now = performance.now();
-      const delta = now - lastFrameTime;
-      if (delta > jankThreshold) {
-        mlog(
-          `JANK ${delta.toFixed(0)}ms (threshold=${jankThreshold}ms) t=${this.video.currentTime.toFixed(3)}`,
-        );
-      }
-      lastFrameTime = now;
-      requestAnimationFrame(checkJank);
-    };
-    requestAnimationFrame(checkJank);
 
     let prevDropped = 0;
     const healthCheck = () => {
@@ -1969,9 +2075,7 @@ export class PlaysVideoEngine extends EventTarget {
         prevDropped = q.droppedVideoFrames;
         const sb = this.video.buffered;
         const ahead =
-          sb.length > 0
-            ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1)
-            : '?';
+          sb.length > 0 ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1) : '?';
         if (newDropped > 0) {
           mlog(
             `health-check dropped=${newDropped} total=${q.totalVideoFrames} ahead=${ahead}s t=${this.video.currentTime.toFixed(3)}`,
@@ -1990,7 +2094,10 @@ export class PlaysVideoEngine extends EventTarget {
     done: boolean;
     totalCues: number;
   }): void {
-    if (msg.requestId !== undefined && this._activeSubtitleRequestIds.get(msg.trackIndex) !== msg.requestId) {
+    if (
+      msg.requestId !== undefined &&
+      this._activeSubtitleRequestIds.get(msg.trackIndex) !== msg.requestId
+    ) {
       mlog(`subtitle track ${msg.trackIndex} ignoring stale batch requestId=${msg.requestId}`);
       return;
     }
@@ -2028,7 +2135,9 @@ export class PlaysVideoEngine extends EventTarget {
       attached = { element: track, url, source: 'embedded', trackIndex: msg.trackIndex, textTrack };
       this.attachedSubtitleTracks.push(attached);
 
-      mlog(`subtitle track ${msg.trackIndex} created incrementally as <track kind=${kind} lang=${lang}>`);
+      mlog(
+        `subtitle track ${msg.trackIndex} created incrementally as <track kind=${kind} lang=${lang}>`,
+      );
     }
 
     const tt = attached.textTrack;
@@ -2068,7 +2177,10 @@ export class PlaysVideoEngine extends EventTarget {
       this.subtitleWindowLoading.delete(msg.trackIndex);
       this.subtitleRequestedWindowEnd.delete(msg.trackIndex);
       this._selectOnExtract.delete(msg.trackIndex);
-      if (msg.requestId !== undefined && this._activeSubtitleRequestIds.get(msg.trackIndex) === msg.requestId) {
+      if (
+        msg.requestId !== undefined &&
+        this._activeSubtitleRequestIds.get(msg.trackIndex) === msg.requestId
+      ) {
         this._activeSubtitleRequestIds.delete(msg.trackIndex);
       }
 
@@ -2202,7 +2314,10 @@ export class PlaysVideoEngine extends EventTarget {
       if (!info) continue;
 
       const attached = this.attachedSubtitleTracks.find(
-        (a) => a.source === 'embedded' && a.trackIndex === trackIndex && a.textTrack?.mode !== 'disabled',
+        (a) =>
+          a.source === 'embedded' &&
+          a.trackIndex === trackIndex &&
+          a.textTrack?.mode !== 'disabled',
       );
       if (!attached) continue;
 
@@ -2214,7 +2329,14 @@ export class PlaysVideoEngine extends EventTarget {
       this.subtitleRequestedWindowEnd.set(trackIndex, endTimeSec);
       const requestId = this.nextSubtitleRequestId(trackIndex);
       mlog(`subtitle prefetch track=${trackIndex} window=[${startSec},${endTimeSec}]`);
-      this.worker.postMessage({ type: 'subtitle', trackIndex, requestId, requestedAtMs, seekTimeSec: startSec, endTimeSec });
+      this.worker.postMessage({
+        type: 'subtitle',
+        trackIndex,
+        requestId,
+        requestedAtMs,
+        seekTimeSec: startSec,
+        endTimeSec,
+      });
     }
   }
 
@@ -2260,11 +2382,20 @@ export class PlaysVideoEngine extends EventTarget {
     this.subtitleRequestTimes.set(track.index, requestedAtMs);
     this.subtitleRequestedWindowEnd.set(track.index, endTimeSec);
     this.subtitleWindowLoading.add(track.index);
-    mlog(`requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec} window=[${startSec},${endTimeSec}]`);
+    mlog(
+      `requesting subtitle track=${track.index} lang=${track.language} codec=${track.codec} window=[${startSec},${endTimeSec}]`,
+    );
     this.dispatchSubtitleStatus(
       `Subtitle track ${track.index}: ${track.language ?? '?'} ${track.codec} queued`,
     );
-    this.worker!.postMessage({ type: 'subtitle', trackIndex: track.index, requestId, requestedAtMs, seekTimeSec, endTimeSec });
+    this.worker!.postMessage({
+      type: 'subtitle',
+      trackIndex: track.index,
+      requestId,
+      requestedAtMs,
+      seekTimeSec,
+      endTimeSec,
+    });
   }
 
   private nextSubtitleRequestId(trackIndex: number): number {
@@ -2430,6 +2561,22 @@ function formatElapsed(ms: number): string {
     return `${(ms / 1000).toFixed(1)}s`;
   }
   return `${Math.round(ms)}ms`;
+}
+
+function inferDirectUrlMimeType(url: string): string | null {
+  let pathname: string;
+  try {
+    pathname = new URL(url, globalThis.location?.href).pathname;
+  } catch {
+    pathname = url.split(/[?#]/, 1)[0] ?? url;
+  }
+
+  const normalizedPath = decodeURIComponent(pathname).toLowerCase();
+  if (normalizedPath.endsWith('.mp4') || normalizedPath.endsWith('.m4v')) {
+    return 'video/mp4';
+  }
+
+  return null;
 }
 
 function makeStats(): LoaderStats {

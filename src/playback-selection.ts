@@ -34,6 +34,9 @@ export interface PlaybackMediaMetadata {
 
   /** Whether demux supplied decoder metadata required for fMP4 audio passthrough. */
   hasAudioDecoderConfig?: boolean;
+
+  /** Whether the source contains an audio track, even if its codec metadata is incomplete. */
+  hasAudioTrack?: boolean;
 }
 
 export type CanPlayTypeResult = '' | 'maybe' | 'probably';
@@ -282,6 +285,18 @@ function evaluateHlsOption(
     code: 'hls-video-supported',
     message: 'The remux/HLS path can play the source video codec.',
   });
+
+  if (!media.sourceAudioCodec && media.hasAudioTrack === true) {
+    diagnostics.push({
+      code: 'hls-audio-missing-decoder-config',
+      message: 'The source has an audio track, but its codec metadata is unavailable; audio will be transcoded to AAC.',
+    });
+    return makeEvaluation(option, 'supported', diagnostics, {
+      pipelineVideoSupported,
+      pipelineAudioSupported: false,
+      pipelineAudioRequiresTranscode: true,
+    });
+  }
 
   if (!media.sourceAudioCodec) {
     diagnostics.push({

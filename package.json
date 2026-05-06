@@ -47,7 +47,7 @@
     "test:sync": "FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 vitest run tests/unit/sync"
   },
   "dependencies": {
-    "hls.js": "^1.5.0",
+    "hls.js": "file:../hls.js",
     "mediabunny": "file:../mediabunny"
   },
   "devDependencies": {

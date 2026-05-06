@@ -135,6 +135,7 @@ export async function parseMkvCueIndex(
 
   let cuesOffset: number | undefined;
   let infoOffset: number | undefined;
+  let tracksOffset: number | undefined;
   let timestampScale = 1_000_000;
 
   const scanPos = segmentDataStart;
@@ -175,11 +176,16 @@ export async function parseMkvCueIndex(
           if (seekId === INFO_ID && seekPosition !== undefined) {
             infoOffset = segmentDataStart + seekPosition;
           }
+          if (seekId === TRACKS_ID && seekPosition !== undefined) {
+            tracksOffset = segmentDataStart + seekPosition;
+          }
         }
         sp += seekEl.dataStart + seekEl.dataSize;
       }
     } else if (el.id === INFO_ID) {
       infoOffset = absPos;
+    } else if (el.id === TRACKS_ID) {
+      tracksOffset = absPos;
     } else if (el.id === CLUSTER_ID) {
       break;
     }
@@ -220,6 +226,12 @@ export async function parseMkvCueIndex(
     return { cuePoints: [], durationSec };
   }
 
+  const videoTrackNumber =
+    tracksOffset === undefined ? null : await readPrimaryVideoTrackNumber(read, fileSize, tracksOffset);
+  if (videoTrackNumber === null) {
+    return { cuePoints: [], durationSec };
+  }
+
   const cuesHdrBuf = await read(cuesOffset, Math.min(cuesOffset + 16, fileSize));
   const cuesEl = readElementHeader(cuesHdrBuf, 0);
   if (!cuesEl || cuesEl.id !== CUES_ID) {
@@ -239,7 +251,7 @@ export async function parseMkvCueIndex(
 
     if (cpEl.id === CUEPOINT_ID) {
       let cueTime: number | undefined;
-      let clusterPosition: number | undefined;
+      const trackPositions: Array<{ track: number | undefined; clusterPosition: number | undefined }> = [];
       const cpEnd = cp + cpEl.dataStart + cpEl.dataSize;
       let inner = cp + cpEl.dataStart;
       while (inner < cpEnd && inner < cuesBuf.length - 2) {
@@ -248,25 +260,34 @@ export async function parseMkvCueIndex(
         if (child.id === CUETIME_ID) {
           cueTime = readUint(cuesBuf, inner + child.dataStart, child.dataSize);
         } else if (child.id === CUETRACKPOSITIONS_ID) {
+          let cueTrack: number | undefined;
+          let clusterPosition: number | undefined;
           const ctpEnd = inner + child.dataStart + child.dataSize;
           let ctpInner = inner + child.dataStart;
           while (ctpInner < ctpEnd && ctpInner < cuesBuf.length - 2) {
             const ctpChild = readElementHeader(cuesBuf, ctpInner);
             if (!ctpChild) break;
-            if (ctpChild.id === CUECLUSTERPOSITION_ID) {
+            if (ctpChild.id === CUETRACK_ID) {
+              cueTrack = readUint(cuesBuf, ctpInner + ctpChild.dataStart, ctpChild.dataSize);
+            } else if (ctpChild.id === CUECLUSTERPOSITION_ID) {
               clusterPosition = readUint(cuesBuf, ctpInner + ctpChild.dataStart, ctpChild.dataSize);
             }
             if (ctpChild.dataSize === UNKNOWN_SIZE) break;
             ctpInner += ctpChild.dataStart + ctpChild.dataSize;
           }
+          trackPositions.push({ track: cueTrack, clusterPosition });
         }
         if (child.dataSize === UNKNOWN_SIZE) break;
         inner += child.dataStart + child.dataSize;
       }
-      if (cueTime !== undefined && clusterPosition !== undefined) {
-        cuePoints.push({
-          timestampMs: (cueTime * timestampScale) / 1_000_000,
-        });
+      if (cueTime !== undefined) {
+        for (const position of trackPositions) {
+          if (position.track === videoTrackNumber && position.clusterPosition !== undefined) {
+            cuePoints.push({
+              timestampMs: (cueTime * timestampScale) / 1_000_000,
+            });
+          }
+        }
       }
     }
 
@@ -275,6 +296,54 @@ export async function parseMkvCueIndex(
   }
 
   return { cuePoints, durationSec };
+}
+
+async function readPrimaryVideoTrackNumber(
+  read: (start: number, end: number) => Uint8Array | Promise<Uint8Array>,
+  fileSize: number,
+  tracksOffset: number,
+): Promise<number | null> {
+  const tracksHdrBuf = await read(tracksOffset, Math.min(tracksOffset + 16, fileSize));
+  const tracksEl = readElementHeader(tracksHdrBuf, 0);
+  if (!tracksEl || tracksEl.id !== TRACKS_ID || tracksEl.dataSize === UNKNOWN_SIZE) {
+    return null;
+  }
+
+  const tracksEnd = tracksEl.dataStart + tracksEl.dataSize;
+  const tracksBuf =
+    tracksEnd <= tracksHdrBuf.length
+      ? tracksHdrBuf
+      : await read(tracksOffset, Math.min(tracksOffset + tracksEnd, fileSize));
+
+  let tp = tracksEl.dataStart;
+  while (tp < tracksEnd && tp < tracksBuf.length - 2) {
+    const trackEl = readElementHeader(tracksBuf, tp);
+    if (!trackEl) break;
+    if (trackEl.id === TRACKENTRY_ID) {
+      let trackNumber: number | undefined;
+      let trackType: number | undefined;
+      const trackEnd = tp + trackEl.dataStart + trackEl.dataSize;
+      let inner = tp + trackEl.dataStart;
+      while (inner < trackEnd && inner < tracksBuf.length - 2) {
+        const child = readElementHeader(tracksBuf, inner);
+        if (!child) break;
+        if (child.id === TRACKNUMBER_ID) {
+          trackNumber = readUint(tracksBuf, inner + child.dataStart, child.dataSize);
+        } else if (child.id === TRACKTYPE_ID) {
+          trackType = readUint(tracksBuf, inner + child.dataStart, child.dataSize);
+        }
+        if (child.dataSize === UNKNOWN_SIZE) break;
+        inner += child.dataStart + child.dataSize;
+      }
+      if (trackNumber !== undefined && trackType === VIDEO_TRACK_TYPE) {
+        return trackNumber;
+      }
+    }
+    if (trackEl.dataSize === UNKNOWN_SIZE) break;
+    tp += trackEl.dataStart + trackEl.dataSize;
+  }
+
+  return null;
 }
 
 const EBML_ID = 0x1a45dfa3;
@@ -286,14 +355,20 @@ const SEEKPOSITION_ID = 0x53ac;
 const INFO_ID = 0x1549a966;
 const TIMESTAMP_SCALE_ID = 0x2ad7b1;
 const DURATION_ID = 0x4489;
+const TRACKS_ID = 0x1654ae6b;
+const TRACKENTRY_ID = 0xae;
+const TRACKNUMBER_ID = 0xd7;
+const TRACKTYPE_ID = 0x83;
 const CUES_ID = 0x1c53bb6b;
 const CUEPOINT_ID = 0xbb;
 const CUETIME_ID = 0xb3;
 const CUETRACKPOSITIONS_ID = 0xb7;
+const CUETRACK_ID = 0xf7;
 const CUECLUSTERPOSITION_ID = 0xf1;
 const CLUSTER_ID = 0x1f43b675;
 
 const UNKNOWN_SIZE = -1;
+const VIDEO_TRACK_TYPE = 1;
 
 interface ElementHeader {
   id: number;

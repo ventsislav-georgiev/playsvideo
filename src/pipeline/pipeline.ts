@@ -1,4 +1,4 @@
-import { transcodeAudioSegment } from './audio-transcode.js';
+import { isAudioTranscodeInputSupported, transcodeAudioSegment } from './audio-transcode.js';
 import { audioNeedsTranscode, type CodecProber, createNodeProber } from './codec-probe.js';
 import { collectPacketsInRange, demuxFile, getKeyframeIndex } from './demux.js';
 import { muxToFmp4 } from './mux.js';
@@ -44,10 +44,20 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       targetSegmentDurationSec: targetDuration,
     });
 
+    if (demux.audioTrack && !demux.audioCodec) {
+      throw new Error(
+        `Unsupported audio track codec: ${demux.audioInternalCodecId ?? 'unknown'}; cannot transcode without a recognized source codec`,
+      );
+    }
+
     const doTranscode =
+      demux.audioTrack !== null &&
       demux.audioCodec !== null &&
       (demux.audioDecoderConfig === null ||
         audioNeedsTranscode(prober, demux.audioCodec, demux.audioDecoderConfig.codec));
+    if (doTranscode && demux.audioCodec && !isAudioTranscodeInputSupported(demux.audioCodec)) {
+      throw new Error(`Unsupported audio transcode source codec: ${demux.audioCodec}`);
+    }
     const outputAudioCodec = doTranscode ? 'aac' : (demux.audioCodec ?? 'aac');
 
     // For transcoded audio, we'll build a new AudioDecoderConfig from the AAC output.
@@ -73,17 +83,24 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       // Transcode audio if needed
       if (doTranscode && audioPackets.length > 0) {
         const sampleRate = demux.audioDecoderConfig?.sampleRate ?? 48000;
+        const outputFrameDurationSec = 1024 / sampleRate;
+        const audioFrameStart = Math.round(seg.startSec / outputFrameDurationSec);
+        const audioFrameEnd = Math.round(endSec / outputFrameDurationSec);
+        const audioStartSec = audioPackets[0].timestamp;
         const transcoded = await transcodeAudioSegment({
           packets: audioPackets,
           sampleRate,
-          audioStartSec: audioPackets[0].timestamp,
+          audioStartSec,
+          outputStartSec: audioFrameStart * outputFrameDurationSec,
+          leadingSilenceSec: seg.sequence === 0 ? Math.max(0, audioStartSec - seg.startSec) : 0,
+          targetDurationSec: seg.durationSec,
+          targetFrameCount: Math.max(0, audioFrameEnd - audioFrameStart),
           ffmpeg: opts.ffmpeg,
           sourceCodec: demux.audioCodec ?? undefined,
+          audioDecoderConfig: demux.audioDecoderConfig,
         });
         audioPackets = transcoded.packets;
-        if (!audioDecoderConfig || audioDecoderConfig.codec !== 'mp4a.40.2') {
-          audioDecoderConfig = transcoded.decoderConfig;
-        }
+        audioDecoderConfig = transcoded.decoderConfig;
       }
 
       // Mux to fMP4
@@ -94,6 +111,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         audioCodec: outputAudioCodec,
         videoDecoderConfig: demux.videoDecoderConfig,
         audioDecoderConfig,
+        fragmentSequenceNumber: seg.sequence + 1,
       });
 
       // Keep the first init segment

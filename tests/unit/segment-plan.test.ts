@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createVideoBoundaryResolver } from '../../src/pipeline/demux.js';
 import { buildSegmentPlan, normalizeKeyframeTimestamps } from '../../src/pipeline/segment-plan.js';
 
 describe('normalizeKeyframeTimestamps', () => {
@@ -131,5 +132,44 @@ describe('buildSegmentPlan', () => {
 
     const totalDuration = plan.reduce((sum, s) => sum + s.durationSec, 0);
     expect(totalDuration).toBeCloseTo(20, 2);
+  });
+});
+
+describe('createVideoBoundaryResolver', () => {
+  const plan = [
+    { sequence: 0, uri: 'seg-0.m4s', startSec: 0, durationSec: 6.479 },
+    { sequence: 1, uri: 'seg-1.m4s', startSec: 6.479, durationSec: 4 },
+    { sequence: 2, uri: 'seg-2.m4s', startSec: 10.479, durationSec: 4 },
+  ];
+
+  it('does not snap a nonzero boundary back to a stale floor keyframe', async () => {
+    const staleKeyframe = { timestamp: 0, sequenceNumber: 0 };
+    const resolver = createVideoBoundaryResolver({
+      getKeyPacket: async () => staleKeyframe,
+      getNextKeyPacket: async () => null,
+    } as any, plan);
+
+    await expect(resolver(1)).resolves.toBeCloseTo(6.479, 6);
+  });
+
+  it('keeps a close floor keyframe as the aligned boundary', async () => {
+    const closeKeyframe = { timestamp: 6.3, sequenceNumber: 1 };
+    const resolver = createVideoBoundaryResolver({
+      getKeyPacket: async () => closeKeyframe,
+      getNextKeyPacket: async () => null,
+    } as any, plan);
+
+    await expect(resolver(1)).resolves.toBeCloseTo(6.3, 6);
+  });
+
+  it('uses a following keyframe inside the next segment when the floor keyframe is stale', async () => {
+    const staleKeyframe = { timestamp: 0, sequenceNumber: 0 };
+    const nextKeyframe = { timestamp: 7.2, sequenceNumber: 1 };
+    const resolver = createVideoBoundaryResolver({
+      getKeyPacket: async () => staleKeyframe,
+      getNextKeyPacket: async () => nextKeyframe,
+    } as any, plan);
+
+    await expect(resolver(1)).resolves.toBeCloseTo(7.2, 6);
   });
 });

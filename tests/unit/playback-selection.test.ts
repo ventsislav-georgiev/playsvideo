@@ -39,6 +39,34 @@ describe('playback-selection', () => {
     expect(result.evaluations.find((e) => e.option.id === 'hls')?.selected).toBe(false);
   });
 
+  it('prefers direct URL playback when remote MP4 codecs are supported', () => {
+    const result = evaluatePlaybackOptions({
+      options: [
+        { mode: 'direct-url', id: 'direct', mimeType: 'video/mp4', url: 'https://example.test/video.mp4' },
+        { mode: 'hls', id: 'hls' },
+      ],
+      media: {
+        sourceVideoCodec: 'avc',
+        sourceAudioCodec: 'aac',
+        videoCodec: 'avc1.640028',
+        audioCodec: 'mp4a.40.2',
+      },
+      capabilities: {
+        canPlayType: (mimeType) => (mimeType === 'video/mp4; codecs="avc1.640028, mp4a.40.2"' ? 'probably' : ''),
+        hlsSupported: true,
+        pipelineProbe: ALL_SUPPORTED_PROBE,
+      },
+    });
+
+    expect(result.recommended?.option).toEqual({
+      mode: 'direct-url',
+      id: 'direct',
+      mimeType: 'video/mp4',
+      url: 'https://example.test/video.mp4',
+    });
+    expect(result.evaluations.find((e) => e.option.id === 'direct')?.status).toBe('supported');
+  });
+
   it('recommends hls when direct playback is unsupported', () => {
     const result = evaluatePlaybackOptions({
       options: [
@@ -96,6 +124,32 @@ describe('playback-selection', () => {
         videoCodec: 'hev1.1.6.L120.B0',
         audioCodec: null,
         hasAudioDecoderConfig: false,
+        hasAudioTrack: true,
+      },
+      capabilities: {
+        hlsSupported: true,
+        pipelineProbe: ALL_SUPPORTED_PROBE,
+      },
+    });
+
+    expect(result.recommended?.option).toEqual({ mode: 'hls', id: 'hls' });
+    expect(result.evaluations[0].status).toBe('supported');
+    expect(result.evaluations[0].pipelineAudioRequiresTranscode).toBe(true);
+    expect(result.evaluations[0].diagnostics.map((d) => d.code)).toContain(
+      'hls-audio-missing-decoder-config',
+    );
+  });
+
+  it('keeps hls viable when an audio track exists but codec metadata is unavailable', () => {
+    const result = evaluatePlaybackOptions({
+      options: [{ mode: 'hls', id: 'hls' }],
+      media: {
+        sourceVideoCodec: 'avc',
+        sourceAudioCodec: null,
+        videoCodec: 'avc1.640028',
+        audioCodec: null,
+        hasAudioDecoderConfig: false,
+        hasAudioTrack: true,
       },
       capabilities: {
         hlsSupported: true,
@@ -161,6 +215,7 @@ describe('playback-selection', () => {
         sourceAudioCodec: null,
         videoCodec: 'avc1.640028',
         audioCodec: null,
+        hasAudioTrack: false,
       },
       capabilities: {
         hlsSupported: true,

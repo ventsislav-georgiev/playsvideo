@@ -27,7 +27,10 @@ export interface TranscodeJobRequest {
   type: 'transcode-job';
   jobId: number;
   inputData: ArrayBuffer;
+  sampleRate: number;
   sourceCodec?: string;
+  inputFormat?: string | null;
+  inputExtension?: string;
 }
 
 export interface TranscodeJobSuccess {

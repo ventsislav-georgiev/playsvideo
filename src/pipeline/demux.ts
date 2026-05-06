@@ -10,13 +10,16 @@ import {
   Source as MBSource,
   UrlSource,
 } from 'mediabunny';
-import type { Source } from '../source.js';
+import { Source } from '../source.js';
+import { checkAbort, type AbortableSource } from './source-signal.js';
 import { getSubtitleTrackInfos } from './subtitle.js';
 import type { KeyframeEntry, KeyframeIndex, PlannedSegment, SubtitleTrackInfo } from './types.js';
 
 const KEYFRAME_LOOKUP_EARLY_SEC = 0.5;
 const KEYFRAME_LOOKUP_LATE_SEC = 0.2;
 const BOUNDARY_ALIGN_EPSILON_SEC = 1 / 1000;
+const URL_READ_RETRIES = 2;
+const URL_READ_CACHE_LIMIT_BYTES = 128 * 1024 * 1024;
 
 export interface DemuxResult {
   input: Input;
@@ -25,6 +28,7 @@ export interface DemuxResult {
   audioTrack: InputAudioTrack | null;
   videoCodec: string;
   audioCodec: string | null;
+  audioInternalCodecId: string | null;
   videoDecoderConfig: VideoDecoderConfig;
   audioDecoderConfig: AudioDecoderConfig | null;
   videoSink: EncodedPacketSink;
@@ -43,6 +47,90 @@ export async function demuxBlob(blob: Blob): Promise<DemuxResult> {
 
 export async function demuxUrl(url: string): Promise<DemuxResult> {
   return demuxInput(new Input({ formats: ALL_FORMATS, source: new UrlSource(url) }));
+}
+
+export class AbortableUrlSource extends Source implements AbortableSource {
+  private _currentSignal: AbortSignal | null = null;
+  private readonly _readCache: Array<{ start: number; end: number; bytes: Uint8Array }> = [];
+  private _readCacheBytes = 0;
+
+  constructor(private readonly _url: string) {
+    super();
+  }
+
+  setCurrentSignal(signal: AbortSignal | null): void {
+    this._currentSignal = signal;
+  }
+
+  async _retrieveSize(): Promise<number | null> {
+    const response = await fetch(this._url, { method: 'HEAD', signal: this._currentSignal ?? undefined });
+    if (!response.ok) {
+      throw new Error(`URL source HEAD failed: HTTP ${response.status}`);
+    }
+    const contentLength = response.headers.get('content-length');
+    const size = contentLength ? Number(contentLength) : NaN;
+    return Number.isFinite(size) && size > 0 ? size : null;
+  }
+
+  async _read(start: number, end: number) {
+    const signal = this._currentSignal ?? undefined;
+    checkAbort(signal);
+
+    const cached = this._readCache.find((entry) => entry.start <= start && entry.end >= end);
+    if (cached) {
+      const bytes = cached.bytes.subarray(start - cached.start, end - cached.start);
+      return this._makeReadResult(bytes, start);
+    }
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= URL_READ_RETRIES; attempt += 1) {
+      try {
+        checkAbort(signal);
+        const response = await fetch(this._url, {
+          headers: { Range: `bytes=${start}-${end - 1}` },
+          signal,
+        });
+        if (response.status !== 206 && response.status !== 200) {
+          throw new Error(`URL source range request failed: HTTP ${response.status}`);
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        this._cacheRead(start, start + bytes.byteLength, bytes);
+        return this._makeReadResult(bytes, start);
+      } catch (err) {
+        lastError = err;
+        checkAbort(signal);
+        if (attempt === URL_READ_RETRIES) break;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private _cacheRead(start: number, end: number, bytes: Uint8Array): void {
+    if (bytes.byteLength > URL_READ_CACHE_LIMIT_BYTES) return;
+
+    this._readCache.push({ start, end, bytes });
+    this._readCacheBytes += bytes.byteLength;
+    while (this._readCacheBytes > URL_READ_CACHE_LIMIT_BYTES) {
+      const evicted = this._readCache.shift();
+      if (!evicted) break;
+      this._readCacheBytes -= evicted.bytes.byteLength;
+    }
+  }
+
+  private _makeReadResult(bytes: Uint8Array, offset: number) {
+    return {
+      bytes,
+      view: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      offset,
+    };
+  }
+
+  _dispose(): void {
+    this._currentSignal = null;
+    this._readCache.length = 0;
+    this._readCacheBytes = 0;
+  }
 }
 
 class SourceAdapter extends MBSource {
@@ -109,8 +197,11 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   }
 
   let audioDecoderConfig: AudioDecoderConfig | null = null;
+  let audioInternalCodecId: string | null = null;
   if (audioTrack) {
     audioDecoderConfig = await audioTrack.getDecoderConfig();
+    const internalCodecId = audioTrack.internalCodecId;
+    audioInternalCodecId = typeof internalCodecId === 'string' ? internalCodecId : null;
   }
 
   const subtitleTracks = await getSubtitleTrackInfos(input);
@@ -121,7 +212,8 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
     videoTrack,
     audioTrack,
     videoCodec,
-    audioCodec: audioTrack?.codec ?? null,
+    audioCodec: audioTrack?.codec ?? mapAudioInternalCodecId(audioInternalCodecId),
+    audioInternalCodecId,
     videoDecoderConfig,
     audioDecoderConfig,
     videoSink,
@@ -129,6 +221,22 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
     subtitleTracks,
     dispose: () => input.dispose(),
   };
+}
+
+function mapAudioInternalCodecId(internalCodecId: string | null): string | null {
+  if (!internalCodecId) return null;
+
+  if (internalCodecId === 'A_TRUEHD') return 'truehd';
+  if (internalCodecId === 'A_MLP') return 'mlp';
+  if (internalCodecId === 'A_AC3') return 'ac3';
+  if (internalCodecId === 'A_EAC3') return 'eac3';
+  if (internalCodecId.startsWith('A_DTS')) return 'dts';
+  if (internalCodecId === 'A_FLAC') return 'flac';
+  if (internalCodecId === 'A_OPUS') return 'opus';
+  if (internalCodecId === 'A_MPEG/L3') return 'mp3';
+  if (internalCodecId.startsWith('A_AAC')) return 'aac';
+
+  return null;
 }
 
 export async function getKeyframeIndex(
@@ -181,6 +289,7 @@ async function resolveActualVideoBoundary(
   }
 
   const timestamp = Number(packet.timestamp);
+  if (Number.isFinite(timestamp) && boundarySec - timestamp > KEYFRAME_LOOKUP_EARLY_SEC) return boundarySec;
   return Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : boundarySec;
 }
 
@@ -238,7 +347,7 @@ export async function collectPacketsInRange(
   sink: EncodedPacketSink,
   startSec: number,
   endSec: number,
-  opts?: { startFromKeyframe?: boolean },
+  opts?: { startFromKeyframe?: boolean; includePacketBeforeStart?: boolean },
 ): Promise<EncodedPacket[]> {
   const packets: EncodedPacket[] = [];
 
@@ -277,7 +386,7 @@ export async function collectPacketsInRange(
   // Without this, getPacket() "floor" semantics cause one AAC frame (~21 ms)
   // to appear in two consecutive fMP4 fragments, producing overlap that
   // manifests as stutter (Safari) or progressive A/V desync (Chrome).
-  if (!opts?.startFromKeyframe) {
+  if (!opts?.startFromKeyframe && !opts?.includePacketBeforeStart) {
     while (packet && packet.timestamp < startSec) {
       const next = await sink.getNextPacket(packet);
       if (!next || next.sequenceNumber === packet.sequenceNumber) {

@@ -70,11 +70,14 @@ async function handleJob(msg: TranscodeJobRequest): Promise<void> {
       await ffmpeg.loadForCodec(msg.sourceCodec);
       updateState({ phase: 'transcoding' });
     }
-    const result = await runFfmpegAudioTranscode({
-      ffmpeg,
-      inputData: new Uint8Array(msg.inputData),
-      sourceCodec: msg.sourceCodec,
-    });
+      const result = await runFfmpegAudioTranscode({
+        ffmpeg,
+        inputData: new Uint8Array(msg.inputData),
+        sampleRate: msg.sampleRate,
+        sourceCodec: msg.sourceCodec,
+        inputFormat: msg.inputFormat,
+        inputExtension: msg.inputExtension,
+      });
     const outputData = new Uint8Array(result.aacData);
     const outputBuffer = outputData.buffer;
     const response: TranscodeJobResponse = {

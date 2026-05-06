@@ -48,7 +48,7 @@ type MediaSourceGlobal = typeof globalThis & {
 
 export function getAvailableMediaSource(): MediaSourceLike | null {
   const scope = globalThis as MediaSourceGlobal;
-  return scope.ManagedMediaSource ?? scope.MediaSource ?? scope.WebKitMediaSource ?? null;
+  return scope.MediaSource ?? scope.WebKitMediaSource ?? scope.ManagedMediaSource ?? null;
 }
 
 /**

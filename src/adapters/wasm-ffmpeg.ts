@@ -1,20 +1,23 @@
 import type { FfmpegRunner } from '../pipeline/types.js';
 
-// Audio-only bundle (~1.5 MB) — AC3/EAC3/DTS/MP3/FLAC/Opus decode → AAC encode
+// Audio-only bundle (~1.5 MB) — AC3/EAC3/DTS/TrueHD/MLP/MP3/FLAC/Opus decode → AAC encode
 // Uses new URL(..., import.meta.url) so any bundler (Vite, Webpack, Rollup, esbuild) can resolve it.
 const audioJsUrl = new URL('../vendor/ffmpeg-core-audio/ffmpeg-core.js', import.meta.url).href;
 const audioWasmUrl = new URL('../vendor/ffmpeg-core-audio/ffmpeg-core.wasm', import.meta.url).href;
+const fullJsUrl = new URL('../vendor/ffmpeg-core/ffmpeg-core.js', import.meta.url).href;
+const fullWasmUrl = new URL('../vendor/ffmpeg-core/ffmpeg-core.wasm', import.meta.url).href;
 
 export type FfmpegTier = 'audio' | 'full';
 
-/** Full tier is not currently used — reserved for future video transcode support. */
-const FULL_TIER_ENABLED = false;
+/** Full tier is used for codecs not present in the minimal audio bundle. */
+const FULL_TIER_ENABLED = true;
 
 /** Codecs the minimal audio bundle can handle (all decoders built into ffmpeg-core-audio). */
 const AUDIO_TIER_CODECS = new Set(['ac3', 'eac3', 'dts', 'mp3', 'flac', 'opus']);
 
-const TIER_URLS: Record<'audio', { coreURL: string; wasmURL: string }> = {
+const TIER_URLS: Record<FfmpegTier, { coreURL: string; wasmURL: string }> = {
   audio: { coreURL: audioJsUrl, wasmURL: audioWasmUrl },
+  full: { coreURL: fullJsUrl, wasmURL: fullWasmUrl },
 };
 
 /** Emscripten module interface returned by createFFmpegCore. */
@@ -71,7 +74,7 @@ async function ensureTier(tier: FfmpegTier): Promise<FFmpegCoreModule> {
 
   pendingTier = tier;
   loadPromise = (async () => {
-    const { coreURL, wasmURL } = TIER_URLS[tier as 'audio'];
+    const { coreURL, wasmURL } = TIER_URLS[tier];
     console.log(`[ffmpeg] loading ${tier} bundle`);
     const { default: createFFmpegCore } = (await import(/* @vite-ignore */ coreURL)) as {
       default: CreateFFmpegCore;

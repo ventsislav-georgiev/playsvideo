@@ -14,11 +14,13 @@ describe('codec-probe', () => {
       expect(prober.canPlayAudio('aac')).toBe(true);
     });
 
-    it('rejects mp3, ac3, eac3, dts, flac, opus', () => {
+    it('rejects mp3, ac3, eac3, dts, truehd, mlp, flac, opus', () => {
       expect(prober.canPlayAudio('mp3')).toBe(false);
       expect(prober.canPlayAudio('ac3')).toBe(false);
       expect(prober.canPlayAudio('eac3')).toBe(false);
       expect(prober.canPlayAudio('dts')).toBe(false);
+      expect(prober.canPlayAudio('truehd')).toBe(false);
+      expect(prober.canPlayAudio('mlp')).toBe(false);
       expect(prober.canPlayAudio('flac')).toBe(false);
       expect(prober.canPlayAudio('opus')).toBe(false);
     });
@@ -58,6 +60,11 @@ describe('codec-probe', () => {
 
     it('dts needs transcode', () => {
       expect(audioNeedsTranscode(prober, 'dts')).toBe(true);
+    });
+
+    it('truehd and mlp need transcode', () => {
+      expect(audioNeedsTranscode(prober, 'truehd')).toBe(true);
+      expect(audioNeedsTranscode(prober, 'mlp')).toBe(true);
     });
 
     it('unknown codecs need transcode (safe default)', () => {

@@ -30,6 +30,7 @@ export interface PlaylistSpec {
 }
 
 export interface FfmpegRunner {
+  loadForCodec?(codec: string): Promise<void>;
   run(args: string[]): Promise<{ exitCode: number; stderr: string }>;
   writeInput(name: string, data: Uint8Array): Promise<void>;
   readOutput(name: string): Promise<Uint8Array>;
