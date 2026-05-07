@@ -45,9 +45,17 @@ export async function demuxFile(filePath: string): Promise<DemuxResult> {
 export async function demuxBlob(blob: Blob): Promise<DemuxResult> {
   return demuxInput(new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) }));
 }
-
 export async function demuxUrl(url: string): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new UrlSource(url) }));
+  const source = new UrlSource(url, {
+    maxCacheSize: 64 * 2 ** 20, // 64 MiB (default)
+    parallelism: 2, // 2 concurrent requests (default)
+    getRetryDelay: (attempts: number, _error: unknown, _url: string | URL | Request) => {
+      // Exponential backoff: 100ms, 200ms, 400ms, then give up
+      if (attempts >= 3) return null;
+      return 100 * 2 ** attempts;
+    },
+  });
+  return demuxInput(new Input({ formats: ALL_FORMATS, source }));
 }
 
 export class AbortableUrlSource extends Source implements AbortableSource {
@@ -75,9 +83,13 @@ export class AbortableUrlSource extends Source implements AbortableSource {
    * See: https://github.com/ventsislav-georgiev/mediabunny/blob/main/src/source.ts#L436-L494
    */
   async _retrieveSize(): Promise<number | null> {
+    if (this._isOfflineUrl()) {
+      return this._retrieveOfflineSize();
+    }
+
     const response = await fetch(this._url, {
       headers: {
-        Range: 'bytes=0-',  // Request all bytes as range
+        Range: 'bytes=0-', // Request all bytes as range
       },
       signal: this._currentSignal ?? undefined,
     });
@@ -110,6 +122,26 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     }
 
     throw new Error(`URL source size detection failed: HTTP ${response.status}`);
+  }
+
+  private async _retrieveOfflineSize(): Promise<number | null> {
+    const response = await fetch(this._url, {
+      method: 'HEAD',
+      signal: this._currentSignal ?? undefined,
+    });
+
+    if (response.status !== 200) {
+      throw new Error(`URL source size detection failed: HTTP ${response.status}`);
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (!contentLength) {
+      throw new Error('HTTP response must surface Content-Length header.');
+    }
+
+    const size = Number(contentLength);
+    this._size = Number.isFinite(size) && size > 0 ? size : null;
+    return this._size;
   }
 
   async _read(start: number, end: number) {
@@ -229,13 +261,25 @@ export async function demuxSource(source: Source): Promise<DemuxResult> {
  * Create a lightweight Input handle for subtitle-only access.
  * Uses its own I/O path so subtitle extraction never contends with
  * segment processing on the main demux handle.
- * The returned Input is probed (format detected, subtitle tracks initialised).
  */
 export async function createSubtitleInput(blob: Blob | null, url: string | null): Promise<Input> {
   let input: Input;
-  if (blob) input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
-  else if (url) input = new Input({ formats: ALL_FORMATS, source: new UrlSource(url) });
-  else throw new Error('No source provided for subtitle input');
+  if (blob) {
+    input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
+  } else if (url) {
+    const source = new UrlSource(url, {
+      maxCacheSize: 64 * 2 ** 20, // 64 MiB (default)
+      parallelism: 2, // 2 concurrent requests (default)
+      getRetryDelay: (attempts: number, _error: unknown, _url: string | URL | Request) => {
+        // Exponential backoff: 100ms, 200ms, 400ms, then give up
+        if (attempts >= 3) return null;
+        return 100 * 2 ** attempts;
+      },
+    });
+    input = new Input({ formats: ALL_FORMATS, source });
+  } else {
+    throw new Error('No source provided for subtitle input');
+  }
   // Trigger format probing so subtitle track methods (getCuesFrom, etc.) are available.
   await input.getSubtitleTracks();
   return input;
@@ -262,7 +306,7 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   const videoSink = new EncodedPacketSink(videoTrack);
   const audioSink = audioTrack ? new EncodedPacketSink(audioTrack) : null;
 
-  const duration = Number(await videoTrack.computeDuration());
+  const duration = await computeTrackDuration(videoTrack);
 
   const videoDecoderConfig = await videoTrack.getDecoderConfig();
   if (!videoDecoderConfig) {
@@ -294,6 +338,43 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
     subtitleTracks,
     dispose: () => input.dispose(),
   };
+}
+
+async function computeTrackDuration(videoTrack: InputVideoTrack): Promise<number> {
+  return getContainerDuration(videoTrack) ?? Number(await videoTrack.computeDuration());
+}
+
+function getContainerDuration(videoTrack: InputVideoTrack): number | null {
+  const trackRecord = toRecord(videoTrack);
+  const backing = toRecord(trackRecord?._backing);
+  const internalTrack = toRecord(backing?.internalTrack);
+  const demuxer = toRecord(internalTrack?.demuxer);
+
+  return (
+    durationFromTimescale(internalTrack?.durationInMovieTimescale, demuxer?.movieTimescale) ??
+    durationFromTimescale(internalTrack?.durationInMediaTimescale, internalTrack?.timescale) ??
+    durationFromTimescale(demuxer?.movieDurationInTimescale, demuxer?.movieTimescale)
+  );
+}
+
+function durationFromTimescale(durationValue: unknown, timescaleValue: unknown): number | null {
+  if (typeof durationValue !== 'number' || typeof timescaleValue !== 'number') return null;
+  if (
+    !Number.isFinite(durationValue) ||
+    !Number.isFinite(timescaleValue) ||
+    durationValue <= 0 ||
+    timescaleValue <= 0
+  ) {
+    return null;
+  }
+
+  const duration = durationValue / timescaleValue;
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
+}
+
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null) return null;
+  return value as Record<string, unknown>;
 }
 
 function mapAudioInternalCodecId(internalCodecId: string | null): string | null {
