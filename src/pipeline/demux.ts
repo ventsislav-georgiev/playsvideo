@@ -11,7 +11,7 @@ import {
   UrlSource,
 } from 'mediabunny';
 import { Source } from '../source.js';
-import { checkAbort, type AbortableSource } from './source-signal.js';
+import { type AbortableSource, checkAbort } from './source-signal.js';
 import { getSubtitleTrackInfos } from './subtitle.js';
 import type { KeyframeEntry, KeyframeIndex, PlannedSegment, SubtitleTrackInfo } from './types.js';
 
@@ -20,6 +20,7 @@ const KEYFRAME_LOOKUP_LATE_SEC = 0.2;
 const BOUNDARY_ALIGN_EPSILON_SEC = 1 / 1000;
 const URL_READ_RETRIES = 2;
 const URL_READ_CACHE_LIMIT_BYTES = 128 * 1024 * 1024;
+const OFFLINE_URL_READ_WINDOW_BYTES = 512 * 1024;
 
 export interface DemuxResult {
   input: Input;
@@ -53,6 +54,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
   private _currentSignal: AbortSignal | null = null;
   private readonly _readCache: Array<{ start: number; end: number; bytes: Uint8Array }> = [];
   private _readCacheBytes = 0;
+  private _size: number | null = null;
 
   constructor(private readonly _url: string) {
     super();
@@ -62,14 +64,52 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     this._currentSignal = signal;
   }
 
+  /**
+   * Determine file size using a single GET request with Range header.
+   * This approach:
+   * - Combines size detection with initial data fetch (single RTT)
+   * - Probes range support via 206 response
+   * - Caches initial chunk for reuse
+   * - Aligns with Mediabunny's UrlSource strategy
+   *
+   * See: https://github.com/ventsislav-georgiev/mediabunny/blob/main/src/source.ts#L436-L494
+   */
   async _retrieveSize(): Promise<number | null> {
-    const response = await fetch(this._url, { method: 'HEAD', signal: this._currentSignal ?? undefined });
-    if (!response.ok) {
-      throw new Error(`URL source HEAD failed: HTTP ${response.status}`);
+    const response = await fetch(this._url, {
+      headers: {
+        Range: 'bytes=0-',  // Request all bytes as range
+      },
+      signal: this._currentSignal ?? undefined,
+    });
+
+    if (response.status === 206) {
+      // Server supports ranges: extract size from Content-Range header
+      const contentRange = response.headers.get('content-range');
+      const match = contentRange?.match(/^bytes 0-\d+\/(\d+)$/);
+      if (match) {
+        const size = Number(match[1]);
+        this._size = Number.isFinite(size) && size > 0 ? size : null;
+        // Cache initial chunk for reuse in subsequent reads
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        this._cacheRead(0, bytes.byteLength, bytes);
+        return this._size;
+      }
+    } else if (response.status === 200) {
+      // Server doesn't support ranges: use Content-Length header
+      const contentLength = response.headers.get('content-length');
+      if (contentLength) {
+        const size = Number(contentLength);
+        this._size = Number.isFinite(size) && size > 0 ? size : null;
+        // Cache entire response for offline mode
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        this._cacheRead(0, bytes.byteLength, bytes);
+        return this._size;
+      } else {
+        throw new Error('HTTP response must surface Content-Length header.');
+      }
     }
-    const contentLength = response.headers.get('content-length');
-    const size = contentLength ? Number(contentLength) : NaN;
-    return Number.isFinite(size) && size > 0 ? size : null;
+
+    throw new Error(`URL source size detection failed: HTTP ${response.status}`);
   }
 
   async _read(start: number, end: number) {
@@ -82,20 +122,28 @@ export class AbortableUrlSource extends Source implements AbortableSource {
       return this._makeReadResult(bytes, start);
     }
 
+    const requestRange = this._makeRequestRange(start, end);
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= URL_READ_RETRIES; attempt += 1) {
       try {
         checkAbort(signal);
         const response = await fetch(this._url, {
-          headers: { Range: `bytes=${start}-${end - 1}` },
+          headers: { Range: `bytes=${requestRange.start}-${requestRange.end - 1}` },
           signal,
         });
         if (response.status !== 206 && response.status !== 200) {
           throw new Error(`URL source range request failed: HTTP ${response.status}`);
         }
         const bytes = new Uint8Array(await response.arrayBuffer());
-        this._cacheRead(start, start + bytes.byteLength, bytes);
-        return this._makeReadResult(bytes, start);
+        const responseStart =
+          this._getResponseStart(response) ?? (response.status === 200 ? 0 : requestRange.start);
+        this._cacheRead(responseStart, responseStart + bytes.byteLength, bytes);
+        const offset = start - responseStart;
+        const length = end - start;
+        if (offset < 0 || offset + length > bytes.byteLength) {
+          throw new Error('URL source range response did not cover requested bytes');
+        }
+        return this._makeReadResult(bytes.subarray(offset, offset + length), start);
       } catch (err) {
         lastError = err;
         checkAbort(signal);
@@ -104,6 +152,30 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     }
 
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private _makeRequestRange(start: number, end: number): { start: number; end: number } {
+    if (!this._isOfflineUrl()) {
+      return { start, end };
+    }
+
+    const requestStart =
+      Math.floor(start / OFFLINE_URL_READ_WINDOW_BYTES) * OFFLINE_URL_READ_WINDOW_BYTES;
+    const requestedWindowEnd = requestStart + OFFLINE_URL_READ_WINDOW_BYTES;
+    const requestEnd = Math.max(end, requestedWindowEnd);
+    return { start: requestStart, end: this._size ? Math.min(requestEnd, this._size) : requestEnd };
+  }
+
+  private _isOfflineUrl(): boolean {
+    return this._url.includes('/offline-video/');
+  }
+
+  private _getResponseStart(response: Response): number | null {
+    const contentRange = response.headers.get('content-range');
+    const match = contentRange?.match(/^bytes (\d+)-\d+\/\d+$/);
+    if (!match) return null;
+    const start = Number(match[1]);
+    return Number.isFinite(start) ? start : null;
   }
 
   private _cacheRead(start: number, end: number, bytes: Uint8Array): void {
@@ -130,6 +202,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     this._currentSignal = null;
     this._readCache.length = 0;
     this._readCacheBytes = 0;
+    this._size = null;
   }
 }
 
@@ -283,13 +356,18 @@ async function resolveActualVideoBoundary(
       packet = next;
       next = await videoSink.getNextKeyPacket(next, { metadataOnly: true });
     }
-    if (next && boundarySec - packet.timestamp > KEYFRAME_LOOKUP_EARLY_SEC && next.timestamp < nextBoundarySec) {
+    if (
+      next &&
+      boundarySec - packet.timestamp > KEYFRAME_LOOKUP_EARLY_SEC &&
+      next.timestamp < nextBoundarySec
+    ) {
       packet = next;
     }
   }
 
   const timestamp = Number(packet.timestamp);
-  if (Number.isFinite(timestamp) && boundarySec - timestamp > KEYFRAME_LOOKUP_EARLY_SEC) return boundarySec;
+  if (Number.isFinite(timestamp) && boundarySec - timestamp > KEYFRAME_LOOKUP_EARLY_SEC)
+    return boundarySec;
   return Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : boundarySec;
 }
 
