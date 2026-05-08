@@ -22,6 +22,14 @@ const URL_READ_RETRIES = 2;
 const URL_READ_CACHE_LIMIT_BYTES = 128 * 1024 * 1024;
 const OFFLINE_URL_READ_WINDOW_BYTES = 512 * 1024;
 
+function elapsed(start: number): string {
+  return `${(performance.now() - start).toFixed(1)}ms`;
+}
+
+function demuxLog(message: string): void {
+  console.log(`[demux] ${message}`);
+}
+
 export interface DemuxResult {
   input: Input;
   duration: number;
@@ -87,6 +95,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
       return this._retrieveOfflineSize();
     }
 
+    const t0 = performance.now();
     const response = await fetch(this._url, {
       headers: {
         Range: 'bytes=0-', // Request all bytes as range
@@ -102,8 +111,12 @@ export class AbortableUrlSource extends Source implements AbortableSource {
         const size = Number(match[1]);
         this._size = Number.isFinite(size) && size > 0 ? size : null;
         // Cache initial chunk for reuse in subsequent reads
+        const tBody = performance.now();
         const bytes = new Uint8Array(await response.arrayBuffer());
         this._cacheRead(0, bytes.byteLength, bytes);
+        demuxLog(
+          `url-size range status=206 total=${this._size ?? 'unknown'} bodyBytes=${bytes.byteLength} fetch=${elapsed(t0)} body=${elapsed(tBody)}`,
+        );
         return this._size;
       }
     } else if (response.status === 200) {
@@ -113,8 +126,12 @@ export class AbortableUrlSource extends Source implements AbortableSource {
         const size = Number(contentLength);
         this._size = Number.isFinite(size) && size > 0 ? size : null;
         // Cache entire response for offline mode
+        const tBody = performance.now();
         const bytes = new Uint8Array(await response.arrayBuffer());
         this._cacheRead(0, bytes.byteLength, bytes);
+        demuxLog(
+          `url-size full status=200 total=${this._size ?? 'unknown'} bodyBytes=${bytes.byteLength} fetch=${elapsed(t0)} body=${elapsed(tBody)}`,
+        );
         return this._size;
       } else {
         throw new Error('HTTP response must surface Content-Length header.');
@@ -125,6 +142,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
   }
 
   private async _retrieveOfflineSize(): Promise<number | null> {
+    const t0 = performance.now();
     const response = await fetch(this._url, {
       method: 'HEAD',
       signal: this._currentSignal ?? undefined,
@@ -141,6 +159,9 @@ export class AbortableUrlSource extends Source implements AbortableSource {
 
     const size = Number(contentLength);
     this._size = Number.isFinite(size) && size > 0 ? size : null;
+    demuxLog(
+      `offline-size HEAD status=${response.status} total=${this._size ?? 'unknown'} elapsed=${elapsed(t0)}`,
+    );
     return this._size;
   }
 
@@ -148,17 +169,18 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     const signal = this._currentSignal ?? undefined;
     checkAbort(signal);
 
-    const cached = this._readCache.find((entry) => entry.start <= start && entry.end >= end);
+    const cached = this._readFromCache(start, end);
     if (cached) {
-      const bytes = cached.bytes.subarray(start - cached.start, end - cached.start);
-      return this._makeReadResult(bytes, start);
+      return this._makeReadResult(cached, start);
     }
 
-    const requestRange = this._makeRequestRange(start, end);
+    const readStart = this._isOfflineUrl() ? (this._firstMissingOffset(start, end) ?? start) : start;
+    const requestRange = this._makeRequestRange(readStart, end);
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= URL_READ_RETRIES; attempt += 1) {
       try {
         checkAbort(signal);
+        const tFetch = performance.now();
         const response = await fetch(this._url, {
           headers: { Range: `bytes=${requestRange.start}-${requestRange.end - 1}` },
           signal,
@@ -166,14 +188,29 @@ export class AbortableUrlSource extends Source implements AbortableSource {
         if (response.status !== 206 && response.status !== 200) {
           throw new Error(`URL source range request failed: HTTP ${response.status}`);
         }
+        const tBody = performance.now();
         const bytes = new Uint8Array(await response.arrayBuffer());
         const responseStart =
           this._getResponseStart(response) ?? (response.status === 200 ? 0 : requestRange.start);
         this._cacheRead(responseStart, responseStart + bytes.byteLength, bytes);
+        const combined = this._readFromCache(start, end);
+        if (combined) {
+          if (this._isOfflineUrl()) {
+            demuxLog(
+              `offline-read fetch requested=${readStart}-${end - 1} target=${start}-${end - 1} fetched=${requestRange.start}-${requestRange.end - 1} responseStart=${responseStart} status=${response.status} bytes=${bytes.byteLength} fetch=${elapsed(tFetch)} body=${elapsed(tBody)}`,
+            );
+          }
+          return this._makeReadResult(combined, start);
+        }
         const offset = start - responseStart;
         const length = end - start;
         if (offset < 0 || offset + length > bytes.byteLength) {
           throw new Error('URL source range response did not cover requested bytes');
+        }
+        if (this._isOfflineUrl()) {
+          demuxLog(
+            `offline-read fetch requested=${readStart}-${end - 1} target=${start}-${end - 1} fetched=${requestRange.start}-${requestRange.end - 1} responseStart=${responseStart} status=${response.status} bytes=${bytes.byteLength} fetch=${elapsed(tFetch)} body=${elapsed(tBody)}`,
+          );
         }
         return this._makeReadResult(bytes.subarray(offset, offset + length), start);
       } catch (err) {
@@ -220,6 +257,50 @@ export class AbortableUrlSource extends Source implements AbortableSource {
       if (!evicted) break;
       this._readCacheBytes -= evicted.bytes.byteLength;
     }
+  }
+
+  private _readFromCache(start: number, end: number): Uint8Array | null {
+    let offset = start;
+    const parts: Uint8Array[] = [];
+
+    while (offset < end) {
+      const entry = this._bestCachedEntryForOffset(offset);
+      if (!entry) return null;
+
+      const sliceEnd = Math.min(end, entry.end);
+      parts.push(entry.bytes.subarray(offset - entry.start, sliceEnd - entry.start));
+      offset = sliceEnd;
+    }
+
+    if (parts.length === 0) return new Uint8Array(0);
+    if (parts.length === 1) return parts[0];
+
+    const bytes = new Uint8Array(end - start);
+    let writeOffset = 0;
+    for (const part of parts) {
+      bytes.set(part, writeOffset);
+      writeOffset += part.byteLength;
+    }
+    return bytes;
+  }
+
+  private _firstMissingOffset(start: number, end: number): number | null {
+    let offset = start;
+    while (offset < end) {
+      const entry = this._bestCachedEntryForOffset(offset);
+      if (!entry) return offset;
+      offset = Math.min(end, entry.end);
+    }
+    return null;
+  }
+
+  private _bestCachedEntryForOffset(offset: number): { start: number; end: number; bytes: Uint8Array } | null {
+    let best: { start: number; end: number; bytes: Uint8Array } | null = null;
+    for (const entry of this._readCache) {
+      if (entry.start > offset || entry.end <= offset) continue;
+      if (!best || entry.end > best.end) best = entry;
+    }
+    return best;
   }
 
   private _makeReadResult(bytes: Uint8Array, offset: number) {
@@ -286,16 +367,22 @@ export async function createSubtitleInput(blob: Blob | null, url: string | null)
 }
 
 async function demuxInput(input: Input): Promise<DemuxResult> {
-  const videoTrack = await input.getPrimaryVideoTrack();
+  const tTotal = performance.now();
+  demuxLog('phase start');
+
+  const videoTrack = await timedDemuxPhase('getPrimaryVideoTrack', () =>
+    input.getPrimaryVideoTrack(),
+  );
   if (!videoTrack) {
     throw new Error('No video track found');
   }
 
   let audioTrack: InputAudioTrack | null = null;
   try {
-    audioTrack = await input.getPrimaryAudioTrack();
+    audioTrack = await timedDemuxPhase('getPrimaryAudioTrack', () => input.getPrimaryAudioTrack());
   } catch {
     // No audio track — that's fine
+    demuxLog('phase getPrimaryAudioTrack failed/no-audio');
   }
 
   const videoCodec = videoTrack.codec;
@@ -306,9 +393,13 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   const videoSink = new EncodedPacketSink(videoTrack);
   const audioSink = audioTrack ? new EncodedPacketSink(audioTrack) : null;
 
-  const duration = await computeTrackDuration(videoTrack);
+  const duration = await timedDemuxPhase('computeTrackDuration', () =>
+    computeTrackDuration(videoTrack),
+  );
 
-  const videoDecoderConfig = await videoTrack.getDecoderConfig();
+  const videoDecoderConfig = await timedDemuxPhase('video.getDecoderConfig', () =>
+    videoTrack.getDecoderConfig(),
+  );
   if (!videoDecoderConfig) {
     throw new Error('Could not get video decoder config');
   }
@@ -316,12 +407,17 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   let audioDecoderConfig: AudioDecoderConfig | null = null;
   let audioInternalCodecId: string | null = null;
   if (audioTrack) {
-    audioDecoderConfig = await audioTrack.getDecoderConfig();
+    audioDecoderConfig = await timedDemuxPhase('audio.getDecoderConfig', () =>
+      audioTrack.getDecoderConfig(),
+    );
     const internalCodecId = audioTrack.internalCodecId;
     audioInternalCodecId = typeof internalCodecId === 'string' ? internalCodecId : null;
   }
 
-  const subtitleTracks = await getSubtitleTrackInfos(input);
+  const subtitleTracks = await timedDemuxPhase('getSubtitleTrackInfos', () =>
+    getSubtitleTrackInfos(input),
+  );
+  demuxLog(`phase complete total=${elapsed(tTotal)}`);
 
   return {
     input,
@@ -340,8 +436,29 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   };
 }
 
+async function timedDemuxPhase<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = performance.now();
+  try {
+    const result = await fn();
+    demuxLog(`phase ${name} done ${elapsed(t0)}`);
+    return result;
+  } catch (err) {
+    demuxLog(
+      `phase ${name} failed ${elapsed(t0)} error=${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
+  }
+}
+
 async function computeTrackDuration(videoTrack: InputVideoTrack): Promise<number> {
-  return getContainerDuration(videoTrack) ?? Number(await videoTrack.computeDuration());
+  const containerDuration = getContainerDuration(videoTrack);
+  if (containerDuration !== null) {
+    demuxLog(`duration source=container value=${containerDuration.toFixed(3)}s`);
+    return containerDuration;
+  }
+
+  demuxLog('duration source=computeDuration fallback');
+  return Number(await videoTrack.computeDuration());
 }
 
 function getContainerDuration(videoTrack: InputVideoTrack): number | null {

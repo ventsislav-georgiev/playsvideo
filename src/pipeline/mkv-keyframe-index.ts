@@ -227,7 +227,9 @@ export async function parseMkvCueIndex(
   }
 
   const videoTrackNumber =
-    tracksOffset === undefined ? null : await readPrimaryVideoTrackNumber(read, fileSize, tracksOffset);
+    tracksOffset === undefined
+      ? null
+      : await readPrimaryVideoTrackNumber(read, fileSize, tracksOffset);
   if (videoTrackNumber === null) {
     return { cuePoints: [], durationSec };
   }
@@ -251,7 +253,10 @@ export async function parseMkvCueIndex(
 
     if (cpEl.id === CUEPOINT_ID) {
       let cueTime: number | undefined;
-      const trackPositions: Array<{ track: number | undefined; clusterPosition: number | undefined }> = [];
+      const trackPositions: Array<{
+        track: number | undefined;
+        clusterPosition: number | undefined;
+      }> = [];
       const cpEnd = cp + cpEl.dataStart + cpEl.dataSize;
       let inner = cp + cpEl.dataStart;
       while (inner < cpEnd && inner < cuesBuf.length - 2) {

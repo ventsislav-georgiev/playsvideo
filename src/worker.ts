@@ -21,6 +21,7 @@ import {
 } from './pipeline/demux.js';
 import {
   buildMkvKeyframeIndexFromBlob,
+  buildMkvKeyframeIndexFromSource,
   buildMkvKeyframeIndexFromUrl,
 } from './pipeline/mkv-keyframe-index.js';
 import { generateVodPlaylist } from './pipeline/playlist.js';
@@ -347,7 +348,7 @@ const segmentAbortControllers = new Map<number, AbortController>();
 // Subtitles use a separate Input instance (subtitleInput) so they never
 // contend with segment processing. The queue serialises extractions to
 // avoid redundant parallel reads.
-let activeSegmentCount = 0;
+let _activeSegmentCount = 0;
 let subtitleInProgress = false;
 let subtitleAbort: AbortController | null = null;
 let subtitleInput: Awaited<ReturnType<typeof createSubtitleInput>> | null = null;
@@ -447,7 +448,7 @@ self.onmessage = (event: MessageEvent) => {
     queuePipelineSetup(() => handleProbe(() => demuxSource(currentSource!)));
   } else if (msg.type === 'remux-pipeline') {
     wlog('recv remux-pipeline');
-    queuePipelineSetup(() => handleRemuxPipeline(msg.keyframeIndex));
+    queuePipelineSetup(() => handleRemuxPipeline(msg.keyframeIndex, msg.initialStartTimeSec));
   } else if (msg.type === 'passthrough-pipeline') {
     wlog('recv passthrough-pipeline — subtitle-only mode');
   } else if (msg.type === 'transcode-port') {
@@ -572,13 +573,15 @@ function schedulePrefetch(startIndex: number): void {
       emitSegmentState(nextIndex, 'prefetching');
       const prefetchIndex = nextIndex;
       prefetchTaskIndexes.add(prefetchIndex);
-      void ensureSegmentTask(nextIndex, signal).catch((err) => {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        emitSegmentState(nextIndex, 'error', { message: String(err) });
-        self.postMessage({ type: 'error', message: String(err) });
-      }).finally(() => {
-        prefetchTaskIndexes.delete(prefetchIndex);
-      });
+      void ensureSegmentTask(nextIndex, signal)
+        .catch((err) => {
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+          emitSegmentState(nextIndex, 'error', { message: String(err) });
+          self.postMessage({ type: 'error', message: String(err) });
+        })
+        .finally(() => {
+          prefetchTaskIndexes.delete(prefetchIndex);
+        });
     }
     nextIndex += 1;
   }
@@ -615,7 +618,7 @@ async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<U
     const onExternalAbort = () => timeoutCtrl.abort();
     signal?.addEventListener('abort', onExternalAbort, { once: true });
 
-    let result;
+    let result: Awaited<ReturnType<typeof processSegmentWithAbort>>;
     try {
       if (currentSource && isAbortableSource(currentSource)) {
         currentSource.setCurrentSignal(timeoutCtrl.signal);
@@ -703,7 +706,10 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
 }
 
 /** Phase 2: full pipeline — engine told us native playback isn't possible. */
-async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
+async function handleRemuxPipeline(
+  prebuiltKeyframeIndex?: KeyframeIndex,
+  initialStartTimeSec?: number,
+) {
   if (!demux) throw new Error('No demux — handleProbe must run first');
   const t0 = performance.now();
 
@@ -715,15 +721,22 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
     const tIndex = performance.now();
     const mkvIndex = currentBlob
       ? await buildMkvKeyframeIndexFromBlob(currentBlob)
-      : currentUrl
-        ? await buildMkvKeyframeIndexFromUrl(currentUrl)
-        : null;
+      : currentSource
+        ? await buildMkvKeyframeIndexFromSource(currentSource)
+        : currentUrl
+          ? await buildMkvKeyframeIndexFromUrl(currentUrl)
+          : null;
     if (mkvIndex) {
       index = mkvIndex;
       wlog(`mkv-cues done ${elapsed(tIndex)} keyframes=${index.keyframes.length}`);
     } else {
-      index = await getKeyframeIndex(demux.videoSink, demux.duration);
-      wlog(`keyframe-index done ${elapsed(tIndex)} keyframes=${index.keyframes.length}`);
+      if (currentUrl?.includes('/offline-video/')) {
+        index = buildTimedKeyframeIndex(demux.duration, targetSegDuration);
+        wlog(`timed-index done ${elapsed(tIndex)} keyframes=${index.keyframes.length}`);
+      } else {
+        index = await getKeyframeIndex(demux.videoSink, demux.duration);
+        wlog(`keyframe-index done ${elapsed(tIndex)} keyframes=${index.keyframes.length}`);
+      }
     }
   }
 
@@ -768,6 +781,7 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
   }
   wlog(`seg0 preprocess done ${elapsed(tSeg0)}`);
 
+  const initialSegmentIndex = findSegmentIndexForTime(initialStartTimeSec);
   wlog(`pipeline complete ${elapsed(t0)} total`);
 
   self.postMessage(
@@ -790,9 +804,39 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
     { transfer: [] },
   ); // don't transfer initData — we need to keep it
 
-  if (!currentSource) {
-    schedulePrefetch(1);
+  schedulePrefetch(initialSegmentIndex !== null && initialSegmentIndex > 0 ? initialSegmentIndex : 1);
+}
+
+function findSegmentIndexForTime(timeSec: unknown): number | null {
+  if (typeof timeSec !== 'number' || !Number.isFinite(timeSec) || timeSec <= 0) {
+    return null;
   }
+
+  const clampedTimeSec = Math.max(0, Math.min(timeSec, demux?.duration ?? timeSec));
+  const index = plan.findIndex((segment, segmentIndex) => {
+    const next = plan[segmentIndex + 1];
+    const endSec = next ? next.startSec : segment.startSec + segment.durationSec;
+    return clampedTimeSec >= segment.startSec && clampedTimeSec < endSec;
+  });
+
+  return index >= 0 ? index : plan.length - 1;
+}
+
+function buildTimedKeyframeIndex(
+  durationSec: number,
+  targetSegmentDurationSec: number,
+): KeyframeIndex {
+  const duration = Number(durationSec);
+  const targetDuration = Math.max(1, Number(targetSegmentDurationSec) || 4);
+  const keyframes = [];
+  for (
+    let timestamp = 0, sequenceNumber = 0;
+    timestamp < duration;
+    timestamp += targetDuration, sequenceNumber += 1
+  ) {
+    keyframes.push({ timestamp, sequenceNumber });
+  }
+  return { duration, keyframes };
 }
 
 /** Re-demux with a fresh File after the old Blob became stale. Keeps the existing plan. */
@@ -819,7 +863,7 @@ function isStaleFileError(err: unknown): boolean {
 }
 
 async function handleSegmentRequest(index: number) {
-  activeSegmentCount++;
+  _activeSegmentCount++;
   const controller = new AbortController();
   segmentAbortControllers.set(index, controller);
   emitSegmentState(index, 'queued');
@@ -841,7 +885,7 @@ async function handleSegmentRequest(index: number) {
     }
   } finally {
     segmentAbortControllers.delete(index);
-    activeSegmentCount--;
+    _activeSegmentCount--;
     void drainSubtitleQueue();
   }
 }
@@ -860,6 +904,7 @@ async function handleSegment(index: number, signal: AbortSignal) {
     wlog(`seg ${index} cache-hit size=${cached.byteLength}`);
     const buffer = cached.buffer.slice(cached.byteOffset, cached.byteOffset + cached.byteLength);
     self.postMessage({ type: 'segment', index, data: buffer }, { transfer: [buffer] });
+    schedulePrefetch(index + 1);
     return;
   }
 

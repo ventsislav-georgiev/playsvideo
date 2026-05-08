@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
 import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, Source } from 'mediabunny';
+import { afterEach, describe, expect, it } from 'vitest';
 import { getKeyframeIndex } from '../../src/pipeline/demux.js';
 
 const FIXTURES_DIR = join(import.meta.dirname, '..', 'fixtures');

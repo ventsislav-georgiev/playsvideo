@@ -6,10 +6,22 @@ function installRangeFetchMock(data: Uint8Array, options?: { supportsRange?: boo
   const supportsRange = options?.supportsRange !== false;
 
   globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === 'HEAD') {
+      requests.push('HEAD');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(data.byteLength),
+          'content-type': 'video/mp4',
+          'accept-ranges': 'bytes',
+        },
+      });
+    }
+
     const range = new Headers(init?.headers).get('range');
     requests.push(range ?? 'none');
 
-    // Size detection request: Range: bytes=0-
+    // Non-offline size detection request: Range: bytes=0-
     if (range === 'bytes=0-') {
       if (supportsRange) {
         // Server supports ranges: return 206 with Content-Range
@@ -96,8 +108,8 @@ describe('AbortableUrlSource', () => {
     expect(requests).toEqual(['bytes=0-']);
   });
 
-  it('fetches aligned read-ahead windows for offline video URLs and serves later reads from cache', async () => {
-    const data = new Uint8Array(1024 * 1024);
+  it('fetches chunk-aligned read-ahead windows for offline video URLs and serves later reads from cache', async () => {
+    const data = new Uint8Array(2 * 1024 * 1024);
     data.forEach((_, index) => {
       data[index] = index % 251;
     });
@@ -113,9 +125,27 @@ describe('AbortableUrlSource', () => {
     expect(Array.from(first.bytes)).toEqual(Array.from(data.slice(10_000, 10_064)));
     expect(Array.from(second.bytes)).toEqual(Array.from(data.slice(250_000, 250_128)));
     expect(Array.from(third.bytes)).toEqual(Array.from(data.slice(530_000, 530_064)));
-    // Size detection + two aligned window requests
-    // First read (10_000-10_064) is served from cached initial chunk (0-65536)
-    expect(requests).toEqual(['bytes=0-', 'bytes=0-524287', 'bytes=524288-1048575']);
+    // Offline size detection uses HEAD to avoid materializing a body through iOS Safari's service worker.
+    // Reads use bounded read-ahead so sparse MP4 metadata probes do not materialize oversized ranges.
+    expect(requests).toEqual(['HEAD', 'bytes=0-524287', 'bytes=524288-1048575']);
+  });
+
+  it('fetches only the missing suffix for overlapping offline reads', async () => {
+    const data = new Uint8Array(2 * 1024 * 1024);
+    data.forEach((_, index) => {
+      data[index] = index % 251;
+    });
+    const requests = installRangeFetchMock(data, { supportsRange: true });
+
+    const source = new AbortableUrlSource('/offline-video/title-1');
+    await source._retrieveSize();
+
+    const tinyProbe = await source._read(0, 12);
+    const metadataProbe = await source._read(40, 600_000);
+
+    expect(Array.from(tinyProbe.bytes)).toEqual(Array.from(data.slice(0, 12)));
+    expect(Array.from(metadataProbe.bytes)).toEqual(Array.from(data.slice(40, 600_000)));
+    expect(requests).toEqual(['HEAD', 'bytes=0-524287', 'bytes=524288-1048575']);
   });
 
   it('keeps exact byte ranges for non-offline URLs', async () => {

@@ -1282,6 +1282,7 @@ export class PlaysVideoEngine extends EventTarget {
         this.ensureTranscodeWorkers();
         const remuxMsg: Record<string, unknown> = { type: 'remux-pipeline' };
         if (this._keyframeIndex) remuxMsg.keyframeIndex = this._keyframeIndex;
+        if (this._initialStartTimeSec !== null) remuxMsg.initialStartTimeSec = this._initialStartTimeSec;
         this.worker!.postMessage(remuxMsg);
       }
     } else if (msg.type === 'ready') {
