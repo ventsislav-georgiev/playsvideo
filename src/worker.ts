@@ -518,12 +518,7 @@ self.onmessage = (event: MessageEvent) => {
       prefetchAbort.abort();
       prefetchAbort = null;
     }
-    if (subtitleAbort) {
-      subtitleAbort.abort();
-      subtitleAbort = null;
-    }
-    subtitleQueue.length = 0;
-    wlog('recv pause — prefetch suspended, subtitle extraction aborted');
+    wlog('recv pause — prefetch suspended, subtitle extraction preserved');
   } else if (msg.type === 'resume') {
     paused = false;
     prefetchAbort = new AbortController();

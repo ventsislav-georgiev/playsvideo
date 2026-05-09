@@ -480,7 +480,9 @@ export class PlaysVideoEngine extends EventTarget {
     const track = this._subtitleTracks.find((t) => t.index === trackIndex);
     if (!track || !this.worker) return false;
     if (select) {
-      this.cancelPendingSubtitleWork();
+      for (const activeTrackIndex of this._activeSubtitleRequestIds.keys()) {
+        this._selectOnExtract.set(activeTrackIndex, false);
+      }
     }
     const alreadyExtracted = this.attachedSubtitleTracks.some(
       (a) => a.source === 'embedded' && a.trackIndex === trackIndex,
@@ -2512,18 +2514,12 @@ export class PlaysVideoEngine extends EventTarget {
 
   private restartEmbeddedSubtitlesFromPosition(seekTimeSec: number): void {
     if (!this.worker) return;
-    this.cancelPendingSubtitleWork();
     const activeEmbedded = this.attachedSubtitleTracks.filter(
       (a) => a.source === 'embedded' && a.textTrack && a.textTrack.mode !== 'disabled',
     );
     if (activeEmbedded.length === 0) return;
 
-    this.subtitleWindowEnd.clear();
-    this.subtitleWindowLoading.clear();
-
     for (const attached of activeEmbedded) {
-      const tt = attached.textTrack!;
-      this.clearTextTrackCues(tt);
       const trackIndex = attached.trackIndex;
       if (trackIndex == null) continue;
       const info = this._subtitleTracks.find((t) => t.index === trackIndex);
@@ -2589,11 +2585,12 @@ export class PlaysVideoEngine extends EventTarget {
     );
     if (attached?.textTrack) {
       this.showTextTrack(attached.textTrack);
-      this.subtitleWindowEnd.delete(trackIndex);
-      this.subtitleWindowLoading.delete(trackIndex);
       const startSec = this.video.currentTime || 0;
       const info = this._subtitleTracks.find((t) => t.index === trackIndex);
-      if (info && attached.textTrack.cues && attached.textTrack.cues.length === 0) {
+      const loadedUntil = this.subtitleWindowEnd.get(trackIndex) ?? 0;
+      const needsWindow =
+        !attached.textTrack.cues || attached.textTrack.cues.length === 0 || startSec + 5 >= loadedUntil;
+      if (info && needsWindow && !this.subtitleWindowLoading.has(trackIndex)) {
         this.requestEmbeddedSubtitleTrack(info, startSec);
       }
       return;

@@ -247,6 +247,8 @@ function cleanCues(raw: SubtitleCue[], codec: string): SubtitleCueEntry[] {
     // the text portion.
     if (codec === 'tx3g' && text.length >= 2) {
       text = extractTx3gText(text);
+    } else if (codec === 'ass' || codec === 'ssa') {
+      text = cleanAssText(text);
     }
 
     text = text.trim();
@@ -282,7 +284,84 @@ function stripAssTags(text: string): string {
   return text
     .replace(/\{\\[^}]*\}/g, '')
     .replace(/\\N/g, '\n')
-    .replace(/\\n/g, '\n');
+    .replace(/\\n/g, '\n')
+    .replace(/\\h/g, ' ');
+}
+
+/**
+ * Convert raw ASS/SSA dialogue payloads to plain cue text.
+ *
+ * Some demuxers expose the full or partial Dialogue payload as `cue.text`
+ * instead of just the final Text field. ASS dialogue fields are comma-separated,
+ * while the final Text field may itself contain commas, so only strip prefixes
+ * that match known ASS field layouts.
+ */
+function cleanAssText(text: string): string {
+  const line = text.trim().replace(/^Dialogue:\s*/i, '');
+  return stripAssTags(extractAssDialogueText(line)).trim();
+}
+
+function extractAssDialogueText(line: string): string {
+  const fields = splitAssFields(line);
+
+  if (hasFullAssDialogueFields(fields)) {
+    return fields[9];
+  }
+  if (hasMediabunnyAssPayloadFields(fields)) {
+    return fields[8];
+  }
+  if (hasAssStylePayloadFields(fields)) {
+    return fields[6];
+  }
+
+  return line;
+}
+
+function splitAssFields(line: string): string[] {
+  const fields: string[] = [];
+  let start = 0;
+  for (let i = 0; i < line.length && fields.length < 9; i++) {
+    if (line[i] === ',') {
+      fields.push(line.slice(start, i));
+      start = i + 1;
+    }
+  }
+  fields.push(line.slice(start));
+  return fields;
+}
+
+function hasFullAssDialogueFields(fields: string[]): boolean {
+  return fields.length === 10
+    && isIntegerField(fields[0])
+    && isAssTimestamp(fields[1])
+    && isAssTimestamp(fields[2])
+    && areAssMarginFields(fields[5], fields[6], fields[7]);
+}
+
+function hasMediabunnyAssPayloadFields(fields: string[]): boolean {
+  return fields.length === 9
+    && isIntegerField(fields[0])
+    && isIntegerField(fields[1])
+    && fields[2].trim().length > 0
+    && areAssMarginFields(fields[4], fields[5], fields[6]);
+}
+
+function hasAssStylePayloadFields(fields: string[]): boolean {
+  return fields.length === 7
+    && fields[0].trim().length > 0
+    && areAssMarginFields(fields[2], fields[3], fields[4]);
+}
+
+function areAssMarginFields(left: string, right: string, vertical: string): boolean {
+  return isIntegerField(left) && isIntegerField(right) && isIntegerField(vertical);
+}
+
+function isIntegerField(value: string): boolean {
+  return /^\d+$/.test(value.trim());
+}
+
+function isAssTimestamp(value: string): boolean {
+  return /^\d+:\d{2}:\d{2}\.\d{1,2}$/.test(value.trim());
 }
 
 /** Extract the ASS header (everything before the first Dialogue: line). */
@@ -383,4 +462,4 @@ function parseSRTTimestamp(ts: string): number {
 }
 
 // Export helpers for use in subtitle-seeking.ts
-export { cleanCues, extractAssHeader, stripAssTags };
+export { cleanAssText, cleanCues, extractAssHeader, stripAssTags };

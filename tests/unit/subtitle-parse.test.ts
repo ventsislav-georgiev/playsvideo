@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  cleanAssText,
   extractSubtitleData,
   parseSubtitleFile,
   subtitleDataToWebVTT,
@@ -162,6 +163,49 @@ describe('tx3g subtitle cleaning', () => {
     const data = await extractSubtitleData(input as any, 0);
 
     expect(data.cues).toHaveLength(0);
+  });
+});
+
+describe('ASS/SSA subtitle cleaning', () => {
+  it('strips leaked mediabunny ASS dialogue fields and converts line breaks', () => {
+    const text = cleanAssText("12,0,Default,,0,0,0,,♪ You've simply forgotten\\NHow to disappear ♪");
+
+    expect(text).toBe("♪ You've simply forgotten\nHow to disappear ♪");
+  });
+
+  it('strips full ASS Dialogue fields while preserving commas in text', () => {
+    const text = cleanAssText(
+      'Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8}Hello, world\\Nagain',
+    );
+
+    expect(text).toBe('Hello, world\nagain');
+  });
+
+  it('cleans embedded ASS cues during extraction', async () => {
+    const input = {
+      async getSubtitleTracks() {
+        return [
+          {
+            codec: 'ass',
+            async *getCues() {
+              yield {
+                timestamp: 1,
+                duration: 2,
+                text: "12,0,Default,,0,0,0,,♪ You've simply forgotten\\NHow to disappear ♪",
+              };
+            },
+            async exportToText() {
+              return '[Events]\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello';
+            },
+          },
+        ];
+      },
+    };
+
+    const data = await extractSubtitleData(input as any, 0);
+
+    expect(data.cues).toHaveLength(1);
+    expect(data.cues[0].text).toBe("♪ You've simply forgotten\nHow to disappear ♪");
   });
 });
 

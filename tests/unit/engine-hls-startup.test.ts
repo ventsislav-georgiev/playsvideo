@@ -5,7 +5,16 @@ class FakeVideoElement extends EventTarget {
   currentTime = 0;
   paused = false;
   buffered = { length: 0 };
-  textTracks = { length: 0 };
+  textTracks: Array<{ mode: TextTrackMode }> = [];
+}
+
+class FakeTextTrack {
+  mode: TextTrackMode = 'showing';
+  cues = [{ startTime: 0, endTime: 2, text: 'hello' }];
+
+  removeCue = vi.fn((cue: { startTime: number; endTime: number; text: string }) => {
+    this.cues = this.cues.filter((existing) => existing !== cue);
+  });
 }
 
 function createEngineForHlsStartup() {
@@ -146,8 +155,47 @@ describe('PlaysVideoEngine HLS startup', () => {
     expect(unsafeEngine._hlsLoadStarted).toBe(true);
   });
 
-  it('defers automatic subtitle extraction until segment startup is delivered', () => {
-    vi.useFakeTimers();
+  it('keeps loaded embedded subtitle cues and requests a seek window after user seek', () => {
+    const { video, unsafeEngine } = createEngineForHlsStartup();
+    const postMessage = vi.fn();
+    const textTrack = new FakeTextTrack();
+    const engineWithSubtitles = unsafeEngine as unknown as {
+      worker: { postMessage: ReturnType<typeof vi.fn> } | null;
+      _subtitleTracks: Array<{ index: number; language: string; codec: string }>;
+      attachedSubtitleTracks: Array<{
+        element: HTMLTrackElement;
+        url: string;
+        source: 'embedded';
+        trackIndex: number;
+        textTrack: FakeTextTrack;
+      }>;
+      _onVideoSeeked(): void;
+    };
+
+    engineWithSubtitles.worker = { postMessage };
+    engineWithSubtitles._subtitleTracks = [{ index: 0, language: 'en', codec: 'srt' }];
+    engineWithSubtitles.attachedSubtitleTracks = [
+      {
+        element: {} as HTMLTrackElement,
+        url: '',
+        source: 'embedded',
+        trackIndex: 0,
+        textTrack,
+      },
+    ];
+    video.currentTime = 42;
+
+    engineWithSubtitles._onVideoSeeked();
+
+    expect(postMessage).not.toHaveBeenCalledWith({ type: 'subtitle-abort' });
+    expect(textTrack.removeCue).not.toHaveBeenCalled();
+    expect(textTrack.cues).toHaveLength(1);
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'subtitle', trackIndex: 0, seekTimeSec: 42 }),
+    );
+  });
+
+  it('requests selected embedded subtitles without aborting existing subtitle work', () => {
     const { unsafeEngine } = createEngineForHlsStartup();
     const postMessage = vi.fn();
     const track = { index: 0, language: 'en', codec: 'srt' };
@@ -155,10 +203,7 @@ describe('PlaysVideoEngine HLS startup', () => {
       worker: { postMessage: ReturnType<typeof vi.fn> } | null;
       _phase: string;
       _subtitleTracks: typeof track[];
-      _subtitleStartupReady: boolean;
-      _deferredSubtitleRequest: { trackIndex: number; select: boolean } | null;
       requestSubtitleExtraction(trackIndex: number, select?: boolean): boolean;
-      markSubtitleStartupReady(reason: string): void;
     };
 
     engineWithSubtitles.worker = { postMessage };
@@ -166,20 +211,9 @@ describe('PlaysVideoEngine HLS startup', () => {
     engineWithSubtitles._subtitleTracks = [track];
 
     expect(engineWithSubtitles.requestSubtitleExtraction(0, true)).toBe(true);
-    expect(postMessage).not.toHaveBeenCalled();
-    expect(engineWithSubtitles._deferredSubtitleRequest).toEqual({ trackIndex: 0, select: true });
-
-    engineWithSubtitles.markSubtitleStartupReady('segment 0 delivered');
-    expect(postMessage).not.toHaveBeenCalled();
-
-    vi.advanceTimersByTime(1499);
-    expect(postMessage).not.toHaveBeenCalled();
-
-    vi.advanceTimersByTime(1);
-    expect(postMessage).toHaveBeenCalledWith({ type: 'subtitle-abort' });
+    expect(postMessage).not.toHaveBeenCalledWith({ type: 'subtitle-abort' });
     expect(postMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'subtitle', trackIndex: 0, seekTimeSec: 0 }),
     );
-    expect(engineWithSubtitles._subtitleStartupReady).toBe(true);
   });
 });
