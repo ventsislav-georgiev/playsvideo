@@ -20,7 +20,9 @@ const KEYFRAME_LOOKUP_LATE_SEC = 0.2;
 const BOUNDARY_ALIGN_EPSILON_SEC = 1 / 1000;
 const URL_READ_RETRIES = 2;
 const URL_READ_CACHE_LIMIT_BYTES = 128 * 1024 * 1024;
+const URL_SIZE_PROBE_BYTES = 64 * 1024;
 const OFFLINE_URL_READ_WINDOW_BYTES = 512 * 1024;
+const ONLINE_URL_READ_WINDOW_BYTES = 8 * 1024 * 1024;
 
 function elapsed(start: number): string {
   return `${(performance.now() - start).toFixed(1)}ms`;
@@ -81,9 +83,9 @@ export class AbortableUrlSource extends Source implements AbortableSource {
   }
 
   /**
-   * Determine file size using a single GET request with Range header.
+   * Determine file size using a bounded GET request with Range header.
    * This approach:
-   * - Combines size detection with initial data fetch (single RTT)
+   * - Combines size detection with a small initial data fetch (single RTT)
    * - Probes range support via 206 response
    * - Caches initial chunk for reuse
    * - Aligns with Mediabunny's UrlSource strategy
@@ -98,39 +100,34 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     const t0 = performance.now();
     const response = await fetch(this._url, {
       headers: {
-        Range: 'bytes=0-', // Request all bytes as range
+        Range: `bytes=0-${URL_SIZE_PROBE_BYTES - 1}`,
       },
       signal: this._currentSignal ?? undefined,
     });
 
     if (response.status === 206) {
-      // Server supports ranges: extract size from Content-Range header
-      const contentRange = response.headers.get('content-range');
-      const match = contentRange?.match(/^bytes 0-\d+\/(\d+)$/);
-      if (match) {
-        const size = Number(match[1]);
-        this._size = Number.isFinite(size) && size > 0 ? size : null;
-        // Cache initial chunk for reuse in subsequent reads
-        const tBody = performance.now();
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        this._cacheRead(0, bytes.byteLength, bytes);
-        demuxLog(
-          `url-size range status=206 total=${this._size ?? 'unknown'} bodyBytes=${bytes.byteLength} fetch=${elapsed(t0)} body=${elapsed(tBody)}`,
-        );
-        return this._size;
+      let size = this._getTotalLengthFromContentRange(response);
+      if (!size) {
+        size = await this._retrieveRemoteHeadSize();
       }
+      this._size = size;
+      // Cache initial chunk for reuse in subsequent reads
+      const tBody = performance.now();
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      this._cacheRead(0, bytes.byteLength, bytes);
+      demuxLog(
+        `url-size range status=206 total=${this._size ?? 'unknown'} bodyBytes=${bytes.byteLength} fetch=${elapsed(t0)} body=${elapsed(tBody)}`,
+      );
+      return this._size;
     } else if (response.status === 200) {
-      // Server doesn't support ranges: use Content-Length header
+      // Server ignored the range. Use Content-Length for size, but do not read the
+      // body here because it may be a multi-GB video.
       const contentLength = response.headers.get('content-length');
       if (contentLength) {
         const size = Number(contentLength);
         this._size = Number.isFinite(size) && size > 0 ? size : null;
-        // Cache entire response for offline mode
-        const tBody = performance.now();
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        this._cacheRead(0, bytes.byteLength, bytes);
         demuxLog(
-          `url-size full status=200 total=${this._size ?? 'unknown'} bodyBytes=${bytes.byteLength} fetch=${elapsed(t0)} body=${elapsed(tBody)}`,
+          `url-size full status=200 total=${this._size ?? 'unknown'} bodyBytes=skipped fetch=${elapsed(t0)}`,
         );
         return this._size;
       } else {
@@ -165,6 +162,26 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     return this._size;
   }
 
+  private async _retrieveRemoteHeadSize(): Promise<number | null> {
+    const t0 = performance.now();
+    const response = await fetch(this._url, {
+      method: 'HEAD',
+      signal: this._currentSignal ?? undefined,
+    });
+    if (response.status !== 200) {
+      throw new Error(`URL source HEAD size detection failed: HTTP ${response.status}`);
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (!contentLength) {
+      throw new Error('HTTP HEAD response must surface Content-Length header.');
+    }
+    const size = Number(contentLength);
+    if (!Number.isFinite(size) || size <= 0) return null;
+    demuxLog(`url-size HEAD status=${response.status} total=${size} elapsed=${elapsed(t0)}`);
+    return size;
+  }
+
   async _read(start: number, end: number) {
     const signal = this._currentSignal ?? undefined;
     checkAbort(signal);
@@ -174,7 +191,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
       return this._makeReadResult(cached, start);
     }
 
-    const readStart = this._isOfflineUrl() ? (this._firstMissingOffset(start, end) ?? start) : start;
+    const readStart = this._firstMissingOffset(start, end) ?? start;
     const requestRange = this._makeRequestRange(readStart, end);
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= URL_READ_RETRIES; attempt += 1) {
@@ -195,11 +212,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
         this._cacheRead(responseStart, responseStart + bytes.byteLength, bytes);
         const combined = this._readFromCache(start, end);
         if (combined) {
-          if (this._isOfflineUrl()) {
-            demuxLog(
-              `offline-read fetch requested=${readStart}-${end - 1} target=${start}-${end - 1} fetched=${requestRange.start}-${requestRange.end - 1} responseStart=${responseStart} status=${response.status} bytes=${bytes.byteLength} fetch=${elapsed(tFetch)} body=${elapsed(tBody)}`,
-            );
-          }
+          this._logReadFetch(readStart, start, end, requestRange, responseStart, response.status, bytes.byteLength, tFetch, tBody);
           return this._makeReadResult(combined, start);
         }
         const offset = start - responseStart;
@@ -207,11 +220,7 @@ export class AbortableUrlSource extends Source implements AbortableSource {
         if (offset < 0 || offset + length > bytes.byteLength) {
           throw new Error('URL source range response did not cover requested bytes');
         }
-        if (this._isOfflineUrl()) {
-          demuxLog(
-            `offline-read fetch requested=${readStart}-${end - 1} target=${start}-${end - 1} fetched=${requestRange.start}-${requestRange.end - 1} responseStart=${responseStart} status=${response.status} bytes=${bytes.byteLength} fetch=${elapsed(tFetch)} body=${elapsed(tBody)}`,
-          );
-        }
+        this._logReadFetch(readStart, start, end, requestRange, responseStart, response.status, bytes.byteLength, tFetch, tBody);
         return this._makeReadResult(bytes.subarray(offset, offset + length), start);
       } catch (err) {
         lastError = err;
@@ -224,15 +233,29 @@ export class AbortableUrlSource extends Source implements AbortableSource {
   }
 
   private _makeRequestRange(start: number, end: number): { start: number; end: number } {
-    if (!this._isOfflineUrl()) {
-      return { start, end };
-    }
-
+    const windowBytes = this._isOfflineUrl() ? OFFLINE_URL_READ_WINDOW_BYTES : ONLINE_URL_READ_WINDOW_BYTES;
     const requestStart =
-      Math.floor(start / OFFLINE_URL_READ_WINDOW_BYTES) * OFFLINE_URL_READ_WINDOW_BYTES;
-    const requestedWindowEnd = requestStart + OFFLINE_URL_READ_WINDOW_BYTES;
+      Math.floor(start / windowBytes) * windowBytes;
+    const requestedWindowEnd = requestStart + windowBytes;
     const requestEnd = Math.max(end, requestedWindowEnd);
     return { start: requestStart, end: this._size ? Math.min(requestEnd, this._size) : requestEnd };
+  }
+
+  private _logReadFetch(
+    readStart: number,
+    start: number,
+    end: number,
+    requestRange: { start: number; end: number },
+    responseStart: number,
+    status: number,
+    byteLength: number,
+    fetchStartedAt: number,
+    bodyStartedAt: number,
+  ): void {
+    const mode = this._isOfflineUrl() ? 'offline-read' : 'url-read';
+    demuxLog(
+      `${mode} fetch requested=${readStart}-${end - 1} target=${start}-${end - 1} fetched=${requestRange.start}-${requestRange.end - 1} responseStart=${responseStart} status=${status} bytes=${byteLength} fetch=${elapsed(fetchStartedAt)} body=${elapsed(bodyStartedAt)}`,
+    );
   }
 
   private _isOfflineUrl(): boolean {
@@ -245,6 +268,17 @@ export class AbortableUrlSource extends Source implements AbortableSource {
     if (!match) return null;
     const start = Number(match[1]);
     return Number.isFinite(start) ? start : null;
+  }
+
+  private _getTotalLengthFromContentRange(response: Response): number | null {
+    const contentRange = response.headers.get('content-range');
+    const rangeMatch = contentRange?.match(/\/(\d+)$/);
+    if (rangeMatch) {
+      const size = Number(rangeMatch[1]);
+      if (Number.isFinite(size) && size > 0) return size;
+    }
+
+    return null;
   }
 
   private _cacheRead(start: number, end: number, bytes: Uint8Array): void {

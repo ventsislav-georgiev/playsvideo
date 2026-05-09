@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      dav1d.js:
+        specifier: ^0.1.1
+        version: 0.1.1
       hls.js:
         specifier: file:../hls.js
         version: file:../hls.js
@@ -1723,6 +1726,9 @@ packages:
   data-uri-to-buffer@6.0.2:
     resolution: {integrity: sha512-7hvf7/GW8e86rW0ptuwS3OcBGDjIi6SZva7hCyWC0yYry2cOPmLIjXAUHI6DK2HsnwJd9ifmt57i8eV2n4YNpw==}
     engines: {node: '>= 14'}
+
+  dav1d.js@0.1.1:
+    resolution: {integrity: sha512-sDUNi6liT4NCJjLS8Ub1t007aFfo4yH+5Q5wwtEBu7Ds0S9PNenYhmED2STDmXZEoZWC6FNxKkrv8OTPFuoA8w==}
 
   debug@2.6.9:
     resolution: {integrity: sha512-bC7ElrdJaJnPbAP+1EotYvqZsb3ecl5wi6Bfi6BJTUcNowp6cvspg0jXznRTKDjm/E7AdgFBVeAPVMNcKGsHMA==}
@@ -5436,6 +5442,8 @@ snapshots:
   data-uri-to-buffer@4.0.1: {}
 
   data-uri-to-buffer@6.0.2: {}
+
+  dav1d.js@0.1.1: {}
 
   debug@2.6.9:
     dependencies:

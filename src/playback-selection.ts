@@ -1,5 +1,7 @@
 import Hls from 'hls.js/light';
+import { isVideoTranscodeInputSupported } from './pipeline/video-transcode.js';
 import { createBrowserProber, getAvailableMediaSource, type MediaSourceLike } from './pipeline/codec-probe.js';
+import { getAv1Fallback, getAv1UnsupportedMessage, getAv1MalformedMessage } from './av1-capability.js';
 
 export type PlaybackMode = 'hls' | 'direct-url' | 'direct-bytes';
 
@@ -37,6 +39,12 @@ export interface PlaybackMediaMetadata {
 
   /** Whether the source contains an audio track, even if its codec metadata is incomplete. */
   hasAudioTrack?: boolean;
+
+  /** Whether the source video codec is AV1. */
+  isAv1Video?: boolean;
+
+  /** AV1 metadata validation result (if applicable). */
+  av1MetadataValid?: boolean | null;
 }
 
 export type CanPlayTypeResult = '' | 'maybe' | 'probably';
@@ -50,12 +58,18 @@ export interface PlaybackCapabilityContext {
   canPlayType?: (mimeType: string) => CanPlayTypeResult;
   hlsSupported?: boolean;
   pipelineProbe?: PipelinePlaybackProbe;
+
+  /** AV1 support detection result (cached). */
+  av1Supported?: 'supported' | 'unsupported' | 'unknown' | null;
 }
 
 export interface BrowserPlaybackCapabilityOptions {
   hlsSupported?: boolean;
   pipelineProbe?: PipelinePlaybackProbe;
   mediaSource?: MediaSourceLike | null;
+
+  /** Pre-detected AV1 support status. */
+  av1Supported?: 'supported' | 'unsupported' | 'unknown' | null;
 }
 
 export type PlaybackDiagnosticCode =
@@ -68,11 +82,15 @@ export type PlaybackDiagnosticCode =
   | 'hls-runtime-unsupported'
   | 'hls-missing-video-codec'
   | 'hls-video-supported'
+  | 'hls-video-transcode'
   | 'hls-video-unsupported'
   | 'hls-audio-supported'
   | 'hls-audio-missing-decoder-config'
   | 'hls-audio-transcode'
   | 'hls-no-audio-track'
+  | 'hls-av1-unsupported'
+  | 'hls-av1-malformed'
+  | 'hls-av1-fallback'
   | 'selected-direct'
   | 'selected-hls'
   | 'no-supported-option';
@@ -91,8 +109,15 @@ export interface PlaybackOptionEvaluation {
   diagnostics: PlaybackDiagnostic[];
   directCanPlayType: CanPlayTypeResult | null;
   pipelineVideoSupported: boolean | null;
+  pipelineVideoRequiresTranscode: boolean | null;
   pipelineAudioSupported: boolean | null;
   pipelineAudioRequiresTranscode: boolean | null;
+
+  /** AV1 support status for this option (if applicable). */
+  av1Supported?: boolean | null;
+
+  /** Whether AV1 fallback was triggered. */
+  av1FallbackTriggered?: boolean;
 }
 
 export interface PlaybackRecommendation {
@@ -132,6 +157,7 @@ export function createBrowserPlaybackCapabilities(
     canPlayType: (mimeType) => normalizeCanPlayType(video.canPlayType(mimeType)),
     hlsSupported: options.hlsSupported ?? Hls.isSupported(),
     pipelineProbe: options.pipelineProbe ?? createBrowserProber(mediaSource ?? null),
+    av1Supported: options.av1Supported ?? null,
   };
 }
 
@@ -238,6 +264,58 @@ function evaluateDirectOption(
   return makeEvaluation(option, 'blocked', diagnostics, { directCanPlayType: result });
 }
 
+
+/**
+ * Evaluates AV1 codec support and metadata validity.
+ * Returns diagnostics and fallback decision if AV1 is unsupported or malformed.
+ */
+function evaluateAv1Codec(
+  media: PlaybackMediaMetadata,
+  capabilities: PlaybackCapabilityContext,
+): {
+  av1Supported: boolean | null;
+  av1FallbackTriggered: boolean;
+  diagnostics: PlaybackDiagnostic[];
+} {
+  const diagnostics: PlaybackDiagnostic[] = [];
+  let av1Supported: boolean | null = null;
+  let av1FallbackTriggered = false;
+
+  // Only evaluate if source is AV1
+  if (!media.isAv1Video) {
+    return { av1Supported: null, av1FallbackTriggered: false, diagnostics };
+  }
+
+  // Check AV1 device support
+  if (capabilities.av1Supported === 'unsupported') {
+    av1Supported = false;
+    av1FallbackTriggered = true;
+    diagnostics.push({
+      code: 'hls-av1-unsupported',
+      message: getAv1UnsupportedMessage(),
+    });
+    return { av1Supported, av1FallbackTriggered, diagnostics };
+  }
+
+  // Check AV1 metadata validity (if validation was performed)
+  if (media.av1MetadataValid === false) {
+    av1Supported = false;
+    av1FallbackTriggered = true;
+    diagnostics.push({
+      code: 'hls-av1-malformed',
+      message: getAv1MalformedMessage(),
+    });
+    return { av1Supported, av1FallbackTriggered, diagnostics };
+  }
+
+  // AV1 is supported or unknown (assume supported for now)
+  if (capabilities.av1Supported === 'supported') {
+    av1Supported = true;
+  }
+
+  return { av1Supported, av1FallbackTriggered, diagnostics };
+}
+
 function evaluateHlsOption(
   option: HlsPlaybackOption,
   media: PlaybackMediaMetadata,
@@ -269,22 +347,51 @@ function evaluateHlsOption(
     return makeEvaluation(option, 'unknown', diagnostics);
   }
 
+  // Evaluate AV1 codec support and metadata validity
+  const av1Evaluation = evaluateAv1Codec(media, capabilities);
+  diagnostics.push(...av1Evaluation.diagnostics);
+
+  // If AV1 is unsupported or malformed, trigger fallback to alternative codec
+  if (av1Evaluation.av1FallbackTriggered) {
+    const fallbackCodec = getAv1Fallback();
+    diagnostics.push({
+      code: 'hls-av1-fallback',
+      message: `AV1 fallback triggered. Attempting to play with ${fallbackCodec.toUpperCase()} codec instead.`,
+    });
+    // Continue evaluation with fallback codec assumption
+    // The engine will handle actual codec substitution
+  }
+
   const pipelineVideoSupported = capabilities.pipelineProbe.canPlayVideo(
     media.sourceVideoCodec,
     media.videoCodec ?? undefined,
   );
+  const pipelineVideoRequiresTranscode =
+    !pipelineVideoSupported && isVideoTranscodeInputSupported(media.sourceVideoCodec);
   if (!pipelineVideoSupported) {
+    if (pipelineVideoRequiresTranscode) {
+      diagnostics.push({
+        code: 'hls-video-transcode',
+        message:
+          'The remux/HLS path cannot play this source video codec here, so video will be transcoded to H.264.',
+      });
+    } else {
+      diagnostics.push({
+        code: 'hls-video-unsupported',
+        message: 'The remux/HLS path cannot play the source video codec in this environment.',
+      });
+      return makeEvaluation(option, 'blocked', diagnostics, {
+        pipelineVideoSupported,
+        av1Supported: av1Evaluation.av1Supported,
+        av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
+      });
+    }
+  } else {
     diagnostics.push({
-      code: 'hls-video-unsupported',
-      message: 'The remux/HLS path cannot play the source video codec in this environment.',
+      code: 'hls-video-supported',
+      message: 'The remux/HLS path can play the source video codec.',
     });
-    return makeEvaluation(option, 'blocked', diagnostics, { pipelineVideoSupported });
   }
-
-  diagnostics.push({
-    code: 'hls-video-supported',
-    message: 'The remux/HLS path can play the source video codec.',
-  });
 
   if (!media.sourceAudioCodec && media.hasAudioTrack === true) {
     diagnostics.push({
@@ -293,8 +400,11 @@ function evaluateHlsOption(
     });
     return makeEvaluation(option, 'supported', diagnostics, {
       pipelineVideoSupported,
+      pipelineVideoRequiresTranscode,
       pipelineAudioSupported: false,
       pipelineAudioRequiresTranscode: true,
+      av1Supported: av1Evaluation.av1Supported,
+      av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
     });
   }
 
@@ -305,8 +415,11 @@ function evaluateHlsOption(
     });
     return makeEvaluation(option, 'supported', diagnostics, {
       pipelineVideoSupported,
+      pipelineVideoRequiresTranscode,
       pipelineAudioSupported: null,
       pipelineAudioRequiresTranscode: false,
+      av1Supported: av1Evaluation.av1Supported,
+      av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
     });
   }
 
@@ -317,8 +430,11 @@ function evaluateHlsOption(
     });
     return makeEvaluation(option, 'supported', diagnostics, {
       pipelineVideoSupported,
+      pipelineVideoRequiresTranscode,
       pipelineAudioSupported: false,
       pipelineAudioRequiresTranscode: true,
+      av1Supported: av1Evaluation.av1Supported,
+      av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
     });
   }
 
@@ -334,8 +450,11 @@ function evaluateHlsOption(
     });
     return makeEvaluation(option, 'supported', diagnostics, {
       pipelineVideoSupported,
+      pipelineVideoRequiresTranscode,
       pipelineAudioSupported,
       pipelineAudioRequiresTranscode: false,
+      av1Supported: av1Evaluation.av1Supported,
+      av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
     });
   }
 
@@ -344,10 +463,13 @@ function evaluateHlsOption(
     message: 'The remux/HLS path remains viable, but audio will be transcoded to AAC.',
   });
   return makeEvaluation(option, 'supported', diagnostics, {
-    pipelineVideoSupported,
-    pipelineAudioSupported,
-    pipelineAudioRequiresTranscode: true,
-  });
+      pipelineVideoSupported,
+      pipelineVideoRequiresTranscode,
+      pipelineAudioSupported,
+      pipelineAudioRequiresTranscode: true,
+      av1Supported: av1Evaluation.av1Supported,
+      av1FallbackTriggered: av1Evaluation.av1FallbackTriggered,
+    });
 }
 
 function makeEvaluation(
@@ -365,8 +487,11 @@ function makeEvaluation(
     diagnostics,
     directCanPlayType: null,
     pipelineVideoSupported: null,
+    pipelineVideoRequiresTranscode: null,
     pipelineAudioSupported: null,
     pipelineAudioRequiresTranscode: null,
+    av1Supported: null,
+    av1FallbackTriggered: false,
     ...overrides,
   };
 }

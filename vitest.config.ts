@@ -6,5 +6,6 @@ export default defineConfig({
     exclude: ['tests/e2e/**'],
     testTimeout: 120_000,
     pool: 'forks',
+    globals: true,
   },
 });

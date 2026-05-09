@@ -30,6 +30,13 @@ const VIDEO_CODEC_MAP: Record<string, string> = {
 // HTMLMediaElement.canPlayType().
 const PIPELINE_UNSAFE_AUDIO = new Set(['ac3', 'eac3']);
 
+// Safari may report AV1 support for MediaSource/fMP4, but AV1 remuxed from
+// Matroska into the HLS pipeline has proven decode-unsafe. Keep native/direct
+// AV1 playback decisions on HTMLMediaElement.canPlayType(), and use the
+// client-side H.264 transcode path for AV1 whenever the remux/HLS pipeline is
+// selected.
+const PIPELINE_UNSAFE_VIDEO = new Set(['av1']);
+
 export interface CodecProber {
   /** Can MSE play this audio codec in an fMP4 container? */
   canPlayAudio(shortCodec: string, fullCodecString?: string): boolean;
@@ -82,6 +89,9 @@ export function createBrowserProber(mediaSource: MediaSourceLike | null = getAva
       return isSupported(`audio/mp4; codecs="${codecStr}"`);
     },
     canPlayVideo(shortCodec, fullCodecString) {
+      if (PIPELINE_UNSAFE_VIDEO.has(shortCodec)) {
+        return false;
+      }
       const codecStr = fullCodecString ?? VIDEO_CODEC_MAP[shortCodec];
       if (!codecStr) return false;
       return isSupported(`video/mp4; codecs="${codecStr}"`);

@@ -129,7 +129,7 @@ pnpm -w run deploy         # both
 - `scripts/deploy.sh` — uploads built files to R2 bucket with correct content types
 - `worker/index.js` — Cloudflare Worker that serves files from R2 and handles caching (no-cache for HTML/SW/manifest, immutable for hashed assets). No COOP/COEP headers needed (see `docs/no-shared-array-buffer.md`)
 
-## Rebuilding ffmpeg.wasm (audio-only)
+## Rebuilding ffmpeg.wasm (audio-only / AV1)
 
 The audio-only bundle is built via Docker on the desktop machine. To rebuild after changing `ffmpegbuild/Dockerfile.ffmpeg-audio`:
 
@@ -138,7 +138,7 @@ The audio-only bundle is built via Docker on the desktop machine. To rebuild aft
 git push
 
 # 2. Build on desktop (has Docker) — pulls, builds, copies to vendor dir
-ssh desktop "cd ~/code/playsvideo && git pull && bash ffmpegbuild/build.sh"
+ssh desktop "cd ~/code/playsvideo && git pull && bash ffmpegbuild/build.sh audio"
 
 # 3. Copy built files back
 scp desktop:~/code/playsvideo/ffmpegbuild/out/ffmpeg-core.js \
@@ -147,6 +147,19 @@ scp desktop:~/code/playsvideo/ffmpegbuild/out/ffmpeg-core.js \
 ```
 
 Build config: `ffmpegbuild/Dockerfile.ffmpeg-audio` (decoders, encoders, filters, etc.)
+
+For client-only AV1 fallback on iPhone, build the AV1 tier instead:
+
+```bash
+ssh desktop "cd ~/code/playsvideo && git pull && bash ffmpegbuild/build.sh av1"
+scp desktop:~/code/playsvideo/ffmpegbuild/out-av1/ffmpeg-core.js \
+    desktop:~/code/playsvideo/ffmpegbuild/out-av1/ffmpeg-core.wasm \
+    src/vendor/ffmpeg-core-av1/
+```
+
+Build config: `ffmpegbuild/Dockerfile.ffmpeg-av1` (`libdav1d` AV1 decode +
+`libx264` H.264 encode + AAC audio encode). This is still client-side wasm; do
+not route this through server transcode.
 
 ## External Consumers
 

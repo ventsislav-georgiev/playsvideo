@@ -2,6 +2,7 @@ import { EncodedPacket, type EncodedPacketSink } from 'mediabunny';
 import { describe, expect, it } from 'vitest';
 import { createAacSilentAdtsFrame } from '../../src/pipeline/audio-transcode.js';
 import { processSegmentWithAbort } from '../../src/pipeline/segment-processor.js';
+import { videoTranscodeFfmpegAudioArgs } from '../../src/pipeline/video-transcode.js';
 
 class SinglePacketSink implements Partial<EncodedPacketSink> {
   constructor(private readonly packets: EncodedPacket[] | EncodedPacket) {}
@@ -206,5 +207,96 @@ describe('segment processor', () => {
     expect(capturedAudioConfig).toBe(outputAacConfig);
     expect(result.audioDecoderConfig).toBe(outputAacConfig);
     expect(result.mediaData.byteLength).toBeGreaterThan(0);
+  });
+
+  it('passes AAC audio directly into AV1 video transcode', async () => {
+    const sourceAacConfig: AudioDecoderConfig = {
+      codec: 'mp4a.40.2',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      description: new Uint8Array([0x11, 0x90]),
+    };
+    const captured: {
+      sourceAudioCodec?: string | null;
+      audioDecoderConfig?: AudioDecoderConfig | null;
+      audioPackets?: EncodedPacket[];
+    } = {};
+
+    const result = await processSegmentWithAbort(
+      {
+        videoSink: new SinglePacketSink([
+          new EncodedPacket(new Uint8Array([0x12, 0x00, 0x0a]), 'key', 0, 1, 0),
+        ]) as EncodedPacketSink,
+        audioSink: new SinglePacketSink([
+          new EncodedPacket(new Uint8Array([0x21, 0x10]), 'key', 0, 1024 / 48000, 0),
+        ]) as EncodedPacketSink,
+        videoCodec: 'av1',
+        audioCodec: 'aac',
+        videoDecoderConfig: {
+          codec: 'av01.0.08M.08',
+          codedWidth: 16,
+          codedHeight: 16,
+          description: new Uint8Array([0x81, 0x00, 0x0c, 0x00, 0x0a]),
+        },
+        sourceAudioDecoderConfig: sourceAacConfig,
+        audioDecoderConfig: sourceAacConfig,
+        plan: [{ sequence: 0, uri: 'seg-0.m4s', startSec: 0, durationSec: 1 }],
+        doTranscode: false,
+        sourceCodec: 'aac',
+        videoTranscode: true,
+        prepareAudioForVideoTranscode: false,
+        sourceVideoCodec: 'av1',
+        transcodeAudio: async () => {
+          throw new Error('AAC audio should not be pre-transcoded for ffmpeg video transcode');
+        },
+        transcodeVideo: async (opts) => {
+          captured.sourceAudioCodec = opts.sourceAudioCodec;
+          captured.audioDecoderConfig = opts.audioDecoderConfig;
+          captured.audioPackets = opts.audioPackets;
+          return {
+            initSegment: new Uint8Array([0x01]),
+            mediaData: new Uint8Array([0x02]),
+            audioDecoderConfig: sourceAacConfig,
+            metrics: {
+              packageMs: 0,
+              writeMs: 0,
+              ffmpegMs: 0,
+              readMs: 0,
+              splitMs: 0,
+              cleanupMs: 0,
+              totalMs: 0,
+              inputBytes: 0,
+              outputBytes: 1,
+              ffmpegSpeed: null,
+              ffmpegTimeMs: null,
+            },
+          };
+        },
+      },
+      0,
+    );
+
+    expect(captured.sourceAudioCodec).toBe('aac');
+    expect(captured.audioDecoderConfig).toBe(sourceAacConfig);
+    expect(captured.audioPackets).toHaveLength(1);
+    expect(result.audioDecoderConfig).toBe(sourceAacConfig);
+    expect(result.mediaData).toEqual(new Uint8Array([0x02]));
+  });
+
+  it('copies AAC during ffmpeg video transcode instead of decoding it', () => {
+    expect(videoTranscodeFfmpegAudioArgs(false, null)).toEqual(['-an']);
+    expect(videoTranscodeFfmpegAudioArgs(true, 'aac')).toEqual(['-map', '0:a:0?', '-c:a', 'copy']);
+    expect(videoTranscodeFfmpegAudioArgs(true, 'opus')).toEqual([
+      '-map',
+      '0:a:0?',
+      '-c:a',
+      'aac',
+      '-ac',
+      '2',
+      '-ar',
+      '48000',
+      '-b:a',
+      '128k',
+    ]);
   });
 });

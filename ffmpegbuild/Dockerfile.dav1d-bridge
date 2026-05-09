@@ -1,0 +1,62 @@
+FROM emscripten/emsdk:3.1.40 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    meson \
+    ninja-build \
+    pkg-config \
+    python3 \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY dav1d /src/dav1d
+COPY playsvideo/ffmpegbuild/dav1d-bridge/dav1d_bridge.c /src/dav1d_bridge.c
+COPY playsvideo/ffmpegbuild/dav1d-bridge/dav1d-bridge.js /src/dav1d-bridge.js
+
+RUN cat > /src/wasm32.meson <<'EOF'
+[binaries]
+c = 'emcc'
+cpp = 'em++'
+ar = 'emar'
+strip = 'emstrip'
+exe_wrapper = 'node'
+
+[properties]
+needs_exe_wrapper = true
+c_args = ['-O3']
+c_link_args = ['-O3']
+
+[host_machine]
+system = 'emscripten'
+cpu_family = 'wasm32'
+cpu = 'wasm32'
+endian = 'little'
+EOF
+
+RUN meson setup /src/dav1d/build-wasm /src/dav1d \
+    --cross-file=/src/wasm32.meson \
+    --default-library=static \
+    -Dbitdepths=8,16 \
+    -Denable_asm=false \
+    -Denable_tools=false \
+    -Denable_tests=false \
+    -Denable_examples=false \
+    -Denable_docs=false \
+    -Dbuildtype=release \
+  && ninja -C /src/dav1d/build-wasm
+
+RUN emcc /src/dav1d_bridge.c \
+    /src/dav1d/build-wasm/src/libdav1d.a \
+    -I/src/dav1d/include \
+    -I/src/dav1d/build-wasm/include \
+    -O3 \
+    --no-entry \
+    -sSTANDALONE_WASM=0 \
+    -sALLOW_MEMORY_GROWTH=1 \
+    -sINITIAL_MEMORY=67108864 \
+    -sEXPORTED_FUNCTIONS='["_djs_alloc_obu","_djs_free","_djs_init","_djs_close","_djs_flush","_djs_send_obu","_djs_receive_frame","_djs_decode_obu"]' \
+    -sERROR_ON_UNDEFINED_SYMBOLS=0 \
+    -o /src/dav1d-bridge.wasm
+
+FROM scratch AS export
+COPY --from=build /src/dav1d-bridge.wasm /dav1d-bridge.wasm
+COPY --from=build /src/dav1d-bridge.js /dav1d-bridge.js

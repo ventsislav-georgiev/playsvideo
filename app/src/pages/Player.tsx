@@ -135,6 +135,7 @@ export function Player() {
     clearExternalSubtitles,
     copyDiagnostics,
     diagnosticsStatus,
+    av1WarningMessage,
     savePosition,
   } =
     useEngine(
@@ -294,9 +295,8 @@ export function Player() {
             {previousEpisode ? (
               <Link to={`/play/${previousEpisode.id}`} state={{ entry: previousEpisode }} className="btn btn-secondary">
                 &larr; Previous
-              </Link>
-            ) : null}
-            {nextEpisode ? (
+              </Link>      ) : null}
+      {nextEpisode ? (
               <button
                 type="button"
                 className="player-episode-nav-link"
@@ -338,6 +338,12 @@ export function Player() {
       <div className="pv-video-container" ref={setContainerEl}>
         <video ref={videoRef} controls={controlsType === 'stock'} autoPlay />
       </div>
+      {av1WarningMessage ? (
+        <div className="player-av1-warning">
+          <div className="player-av1-warning-icon">⚠️</div>
+          <div className="player-av1-warning-text">{av1WarningMessage}</div>
+        </div>
+      ) : null}
       {needsPermission && (
         <button className="btn btn-primary player-permission-btn" onClick={retryPermission}>
           {folderProvider.requiresPermissionGrant

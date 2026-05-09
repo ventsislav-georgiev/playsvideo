@@ -4,6 +4,11 @@ import { collectPacketsInRange, type SegmentBoundaryResolver } from './demux.js'
 import { muxToFmp4 } from './mux.js';
 import { checkAbort } from './source-signal.js';
 import type { PlannedSegment } from './types.js';
+import type { VideoTranscodeExecutor } from './video-transcode.js';
+import { assertMonotonicTimestamps } from './timestamp-utils.js';
+import { validateSegmentBeforeMux } from './segment-validation.js';
+import { copyOrTranscode, shouldEnableAacCopy } from './aac-copy-integration.js';
+import { validateAacEsds } from './aac-esds-validator.js';
 
 const AAC_SAMPLES_PER_FRAME = 1024;
 const AUDIO_TRANSCODE_PREROLL_FRAMES = 6;
@@ -21,8 +26,17 @@ export interface SegmentProcessorConfig {
   doTranscode: boolean;
   transcodeAudio: AudioTranscodeExecutor;
   sourceCodec?: string;
+  videoTranscode?: boolean;
+  transcodeVideo?: VideoTranscodeExecutor;
+  prepareAudioForVideoTranscode?: boolean;
+  sourceVideoCodec?: string;
+  sourceVideoDecoderConfig?: VideoDecoderConfig | null;
   resolveSegmentBoundary?: SegmentBoundaryResolver;
   log?: (msg: string) => void;
+  /** Enable AAC copy optimization (default: false) */
+  enableAacCopy?: boolean;
+  /** Container format for copy decision (default: 'fmp4') */
+  containerFormatForCopy?: string;
 }
 
 export interface SegmentProcessorResult {
@@ -131,7 +145,7 @@ export async function processSegmentWithAbort(
   const audioFrameEnd = Math.round(endSec / outputFrameDurationSec);
   const audioOutputStartSec = audioFrameStart * outputFrameDurationSec;
   const targetFrameCount = Math.max(0, audioFrameEnd - audioFrameStart);
-  if (config.doTranscode && config.audioSink) {
+  if ((config.doTranscode || config.prepareAudioForVideoTranscode) && config.audioSink) {
     const prerollSec = AUDIO_TRANSCODE_PREROLL_FRAMES * outputFrameDurationSec;
     const postrollSec = AUDIO_TRANSCODE_POSTROLL_FRAMES * outputFrameDurationSec;
     const transcodeStartSec = index > 0 ? Math.max(0, seg.startSec - prerollSec) : seg.startSec;
@@ -158,7 +172,86 @@ export async function processSegmentWithAbort(
 
   checkAbort(signal);
 
-  // Stage 3: Transcode audio if needed (slow — ffmpeg.wasm)
+  if (config.videoTranscode) {
+    if (!config.transcodeVideo) {
+      throw new Error('Video transcode requested without a video transcode executor');
+    }
+    let videoTranscodeAudioPackets = audioPackets;
+    let videoTranscodeAudioDecoderConfig = config.sourceAudioDecoderConfig ?? config.audioDecoderConfig;
+    let videoTranscodeSourceAudioCodec = config.sourceCodec ?? config.audioCodec;
+    if (config.prepareAudioForVideoTranscode && transcodeAudioPackets.length > 0) {
+      const sampleRate = outputSampleRate;
+      const audioStartSec = transcodeAudioPackets[0].timestamp;
+      const leadingSilenceSec = index === 0 ? Math.max(0, audioStartSec - seg.startSec) : 0;
+      const audioStartDrift = audioOutputStartSec - seg.startSec;
+      const audioEndDrift = audioFrameEnd * outputFrameDurationSec - endSec;
+      log(
+        `seg ${index} video-transcode-audio-start sourceCodec=${config.sourceCodec ?? 'unknown'} packets=${transcodeAudioPackets.length} sourceDecoderConfig=${config.sourceAudioDecoderConfig ? 'yes' : 'no'} outputDecoderConfig=${config.audioDecoderConfig ? 'yes' : 'no'} frameWindow=[${audioFrameStart},${audioFrameEnd}) frameCount=${targetFrameCount} audioStartDrift=${audioStartDrift.toFixed(6)} audioEndDrift=${audioEndDrift.toFixed(6)}`,
+      );
+      const transcodedAudio = await config.transcodeAudio(
+        {
+          packets: transcodeAudioPackets,
+          sampleRate,
+          audioStartSec,
+          outputStartSec: audioOutputStartSec,
+          trimStartSec: transcodeTrimStartSec,
+          leadingSilenceSec,
+          targetDurationSec: seg.durationSec,
+          targetFrameCount,
+          sourceCodec: config.sourceCodec,
+          audioDecoderConfig: config.sourceAudioDecoderConfig ?? config.audioDecoderConfig,
+        },
+        signal,
+      );
+      const audioMetrics = transcodedAudio.metrics;
+      const audioSpeed = audioMetrics.ffmpegSpeed !== null ? ` speed=${audioMetrics.ffmpegSpeed}x` : '';
+      log(
+        `seg ${index} video-transcode-audio ${audioMetrics.totalMs.toFixed(1)}ms base=${audioStartSec.toFixed(6)} planned=${seg.startSec.toFixed(6)} outputStart=${audioOutputStartSec.toFixed(6)} baseDelta=${(audioStartSec - seg.startSec).toFixed(6)} prerollTrim=${transcodeTrimStartSec.toFixed(6)} padStart=${leadingSilenceSec.toFixed(6)} targetDur=${seg.durationSec.toFixed(6)} targetFrames=${targetFrameCount} audio=${audioMetrics.audioDurationSec.toFixed(2)}s outDur=${audioMetrics.outputDurationSec.toFixed(2)}s ratio=${audioMetrics.realtimeRatio.toFixed(4)}x ffmpeg=${audioMetrics.ffmpegMs.toFixed(1)}ms${audioSpeed}`,
+      );
+      videoTranscodeAudioPackets = transcodedAudio.packets;
+      videoTranscodeAudioDecoderConfig = transcodedAudio.decoderConfig;
+      videoTranscodeSourceAudioCodec = 'aac';
+      if (videoTranscodeAudioPackets.length > 0) {
+        const outFirst = videoTranscodeAudioPackets[0].timestamp;
+        const outLast = videoTranscodeAudioPackets[videoTranscodeAudioPackets.length - 1];
+        const outEnd = outLast.timestamp + outLast.duration;
+        log(
+          `seg ${index} video-transcode-out-audio sr=${transcodedAudio.decoderConfig.sampleRate} frames=${videoTranscodeAudioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${(endSec - outEnd).toFixed(4)}`,
+        );
+      }
+    }
+    const tVideoTranscode = performance.now();
+    log(
+      `seg ${index} video-transcode-start sourceVideo=${config.sourceVideoCodec ?? config.videoCodec} sourceAudio=${videoTranscodeSourceAudioCodec ?? 'none'} videoPkts=${videoPackets.length} audioPkts=${videoTranscodeAudioPackets.length}`,
+    );
+    const transcoded = await config.transcodeVideo(
+      {
+        videoPackets,
+        audioPackets: videoTranscodeAudioPackets,
+        sourceVideoCodec: config.sourceVideoCodec ?? config.videoCodec,
+        sourceAudioCodec: videoTranscodeSourceAudioCodec,
+        videoDecoderConfig: config.sourceVideoDecoderConfig ?? config.videoDecoderConfig,
+        audioDecoderConfig: videoTranscodeAudioDecoderConfig,
+        segmentStartSec: seg.startSec,
+        segmentDurationSec: seg.durationSec,
+        fragmentSequenceNumber: index + 1,
+        log,
+      },
+      signal,
+    );
+    const m = transcoded.metrics;
+    const speed = m.ffmpegSpeed !== null ? ` speed=${m.ffmpegSpeed}x` : '';
+    log(
+      `seg ${index} video-transcode ${elapsed(tVideoTranscode)} package=${m.packageMs.toFixed(1)}ms ffmpeg=${m.ffmpegMs.toFixed(1)}ms split=${m.splitMs.toFixed(1)}ms in=${m.inputBytes} out=${m.outputBytes}${speed}`,
+    );
+    return {
+      mediaData: transcoded.mediaData,
+      initSegment: transcoded.initSegment,
+      audioDecoderConfig: transcoded.audioDecoderConfig,
+    };
+  }
+
+  // Stage 3: Copy or transcode audio if needed
   let audioDecoderConfig = config.audioDecoderConfig;
   if (config.doTranscode && transcodeAudioPackets.length > 0) {
     const sampleRate = outputSampleRate;
@@ -166,43 +259,62 @@ export async function processSegmentWithAbort(
     const leadingSilenceSec = index === 0 ? Math.max(0, audioStartSec - seg.startSec) : 0;
     const audioStartDrift = audioOutputStartSec - seg.startSec;
     const audioEndDrift = audioFrameEnd * outputFrameDurationSec - endSec;
+
+    // Determine if AAC copy should be attempted
+    const enableAacCopy = config.enableAacCopy ?? false;
+    const containerFormat = config.containerFormatForCopy ?? 'fmp4';
+    const sourceCodec = config.sourceCodec ?? config.audioCodec;
+    const shouldAttemptCopy = shouldEnableAacCopy(sourceCodec, containerFormat);
+
     log(
-      `seg ${index} transcode-start sourceCodec=${config.sourceCodec ?? 'unknown'} packets=${transcodeAudioPackets.length} sourceDecoderConfig=${config.sourceAudioDecoderConfig ? 'yes' : 'no'} outputDecoderConfig=${config.audioDecoderConfig ? 'yes' : 'no'} frameWindow=[${audioFrameStart},${audioFrameEnd}) frameCount=${targetFrameCount} audioStartDrift=${audioStartDrift.toFixed(6)} audioEndDrift=${audioEndDrift.toFixed(6)}`,
+      `seg ${index} audio-process-start sourceCodec=${sourceCodec ?? 'unknown'} packets=${transcodeAudioPackets.length} sourceDecoderConfig=${config.sourceAudioDecoderConfig ? 'yes' : 'no'} outputDecoderConfig=${config.audioDecoderConfig ? 'yes' : 'no'} frameWindow=[${audioFrameStart},${audioFrameEnd}) frameCount=${targetFrameCount} audioStartDrift=${audioStartDrift.toFixed(6)} audioEndDrift=${audioEndDrift.toFixed(6)} aacCopyEnabled=${enableAacCopy} shouldAttemptCopy=${shouldAttemptCopy}`,
     );
-    const transcoded = await config.transcodeAudio(
-      {
-        packets: transcodeAudioPackets,
-        sampleRate,
-        audioStartSec,
-        outputStartSec: audioOutputStartSec,
-        trimStartSec: transcodeTrimStartSec,
-        leadingSilenceSec,
-        targetDurationSec: seg.durationSec,
-        targetFrameCount,
-        sourceCodec: config.sourceCodec,
-        audioDecoderConfig: config.sourceAudioDecoderConfig ?? config.audioDecoderConfig,
-      },
-      signal,
-    );
-    const m = transcoded.metrics;
-    const speed = m.ffmpegSpeed !== null ? ` speed=${m.ffmpegSpeed}x` : '';
+
+    // Use copy-or-transcode orchestration
+    const copyOrTranscodeConfig = {
+      enableAacCopy,
+      containerFormat,
+      sourceCodec: sourceCodec ?? null,
+      transcodeExecutor: config.transcodeAudio,
+      log,
+    };
+
+    const transcodeOpts = {
+      packets: transcodeAudioPackets,
+      sampleRate,
+      audioStartSec,
+      outputStartSec: audioOutputStartSec,
+      trimStartSec: transcodeTrimStartSec,
+      leadingSilenceSec,
+      targetDurationSec: seg.durationSec,
+      targetFrameCount,
+      sourceCodec: config.sourceCodec,
+      audioDecoderConfig: config.sourceAudioDecoderConfig ?? config.audioDecoderConfig,
+    };
+
+    const result = await copyOrTranscode(transcodeAudioPackets, copyOrTranscodeConfig, transcodeOpts, signal);
+
+    const m = result.transcodeMetrics ?? result.copyMetrics;
+    const speed = m?.ffmpegSpeed !== null ? ` speed=${m?.ffmpegSpeed}x` : '';
+    const method = result.copiedSuccessfully ? 'copy' : 'transcode';
     log(
-      `seg ${index} transcode ${m.totalMs.toFixed(1)}ms base=${audioStartSec.toFixed(6)} planned=${seg.startSec.toFixed(6)} outputStart=${audioOutputStartSec.toFixed(6)} baseDelta=${(audioStartSec - seg.startSec).toFixed(6)} prerollTrim=${transcodeTrimStartSec.toFixed(6)} padStart=${leadingSilenceSec.toFixed(6)} targetDur=${seg.durationSec.toFixed(6)} targetFrames=${targetFrameCount} audio=${m.audioDurationSec.toFixed(2)}s outDur=${m.outputDurationSec.toFixed(2)}s ratio=${m.realtimeRatio.toFixed(4)}x ffmpeg=${m.ffmpegMs.toFixed(1)}ms${speed}`,
+      `seg ${index} audio-${method} ${m?.totalMs.toFixed(1) ?? '?'}ms base=${audioStartSec.toFixed(6)} planned=${seg.startSec.toFixed(6)} outputStart=${audioOutputStartSec.toFixed(6)} baseDelta=${(audioStartSec - seg.startSec).toFixed(6)} prerollTrim=${transcodeTrimStartSec.toFixed(6)} padStart=${leadingSilenceSec.toFixed(6)} targetDur=${seg.durationSec.toFixed(6)} targetFrames=${targetFrameCount} audio=${m?.audioDurationSec?.toFixed(2) ?? '?'}s outDur=${m?.outputDurationSec?.toFixed(2) ?? '?'}s ratio=${m?.realtimeRatio?.toFixed(4) ?? '?'}x reason="${result.reason}"${speed}`,
     );
-    audioPackets = transcoded.packets;
+
+    audioPackets = result.packets;
     if (audioPackets.length > 0) {
       const outFirst = audioPackets[0].timestamp;
       const outLast = audioPackets[audioPackets.length - 1];
       const outEnd = outLast.timestamp + outLast.duration;
       const gapToSegEnd = endSec - outEnd;
       log(
-        `seg ${index} out-audio sr=${transcoded.decoderConfig.sampleRate} frames=${audioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${gapToSegEnd.toFixed(4)}`,
+        `seg ${index} out-audio sr=${result.decoderConfig.sampleRate} frames=${audioPackets.length} ts=[${outFirst.toFixed(4)},${outEnd.toFixed(4)}] dur=${(outEnd - outFirst).toFixed(4)} gapToSegEnd=${gapToSegEnd.toFixed(4)}`,
       );
       log(
-        `seg ${index} continuity-audio transcode startDelta=${(outFirst - seg.startSec).toFixed(6)} endGap=${gapToSegEnd.toFixed(6)}`,
+        `seg ${index} continuity-audio ${method} startDelta=${(outFirst - seg.startSec).toFixed(6)} endGap=${gapToSegEnd.toFixed(6)}`,
       );
     }
-    audioDecoderConfig = transcoded.decoderConfig;
+    audioDecoderConfig = result.decoderConfig;
   }
 
   // Keep encoded audio frames on their natural sample grid.  Safari is strict
@@ -220,6 +332,9 @@ export async function processSegmentWithAbort(
 
   checkAbort(signal);
 
+  // P0 Hardening: Assert monotonic timestamps
+  assertMonotonicTimestamps(videoPackets, audioPackets, index);
+
   // Stage 4: Mux to fMP4 (fast)
   const outputAudioCodec = config.doTranscode ? 'aac' : config.audioCodec;
   if (audioPackets.length > 0 && !audioDecoderConfig) {
@@ -230,6 +345,18 @@ export async function processSegmentWithAbort(
   if (audioPackets.length > 0 && !outputAudioCodec) {
     throw new Error('Cannot mux audio without an output audio codec');
   }
+
+  // P0 Hardening: Validate segment structure before muxing
+  validateSegmentBeforeMux(
+    videoPackets,
+    audioPackets,
+    config.videoCodec,
+    config.audioCodec,
+    config.videoDecoderConfig,
+    audioDecoderConfig,
+    index,
+  );
+
   const tMux = performance.now();
   const muxResult = await muxToFmp4({
     videoPackets,
@@ -241,6 +368,20 @@ export async function processSegmentWithAbort(
     fragmentSequenceNumber: index + 1,
   });
   log(`seg ${index} mux ${elapsed(tMux)}`);
+
+  // Post-mux AAC esds validation (soft validation, log-only)
+  if (audioPackets.length > 0 && audioDecoderConfig && outputAudioCodec === 'aac') {
+    const esdsValidation = validateAacEsds(
+      muxResult.init,
+      audioDecoderConfig,
+      (msg: string) => log(`seg ${index} aac-esds-validation ${msg}`),
+    );
+    if (esdsValidation.errors.length > 0) {
+      log(
+        `seg ${index} aac-esds-validation-warning errors=[${esdsValidation.errors.join('; ')}] found=${esdsValidation.found} decoderSpecificInfoFound=${esdsValidation.decoderSpecificInfoFound}`,
+      );
+    }
+  }
 
   // Concatenate media fragments
   const totalLen = muxResult.media.reduce((s, c) => s + c.byteLength, 0);

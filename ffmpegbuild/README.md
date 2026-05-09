@@ -12,6 +12,7 @@ file actually needs.
 | *(none)* | AAC, MP3, Opus | MSE plays these natively — no ffmpeg needed | 0 |
 | `ffmpeg-core-audio` | AC3/EAC3/DTS → AAC | Most movie files (DVD/Blu-ray rips) | ~2-5 MB |
 | `ffmpeg-core` | Everything | Fallback for unusual codecs (FLAC in old browsers, etc.) | ~32 MB |
+| `ffmpeg-core-av1` | AV1 → H.264/AAC (`libdav1d` + `libx264`) | Runtime reports AV1 cannot be appended to MSE/HLS | large |
 
 The worker detects the audio codec at demux time and loads the smallest
 sufficient bundle on demand. Most files are either AAC (no download) or
@@ -26,6 +27,9 @@ Requires Docker 23.0+ with buildx.
 # Build (first run ~30-60 min, subsequent builds much faster due to layer cache)
 docker buildx build -f ffmpegbuild/Dockerfile.ffmpeg-audio -o ffmpegbuild/out .
 
+# Or via the helper:
+bash ffmpegbuild/build.sh audio
+
 # Check the output size
 ls -lh ffmpegbuild/out/
 
@@ -33,6 +37,28 @@ ls -lh ffmpegbuild/out/
 mkdir -p src/vendor/ffmpeg-core-audio
 cp ffmpegbuild/out/ffmpeg-core.{js,wasm} src/vendor/ffmpeg-core-audio/
 ```
+
+## Building the AV1 Client Transcode Bundle
+
+The stock `@ffmpeg/core` can parse AV1 containers, but it does not include a
+software AV1 decoder in wasm. On iPhone that produces failures like
+`hardware accelerated AV1 decoding`, `Function not implemented`, and
+`Missing Sequence Header`. For client-only AV1 fallback, build the AV1 tier:
+
+```bash
+# First run is slow: this builds x264, dav1d, FFmpeg, and the wasm wrapper.
+bash ffmpegbuild/build.sh av1
+
+# Equivalent raw Docker command:
+docker buildx build -f ffmpegbuild/Dockerfile.ffmpeg-av1 -o ffmpegbuild/out-av1 .
+mkdir -p src/vendor/ffmpeg-core-av1
+cp ffmpegbuild/out-av1/ffmpeg-core.{js,wasm} src/vendor/ffmpeg-core-av1/
+```
+
+`WasmFfmpegRunner.loadForCodec('av1')` loads `ffmpeg-core-av1` instead of the
+stock full core. This keeps desktop Safari/Chrome on the fast remux path when
+AV1 is supported, and only loads the heavy AV1 core when the runtime codec probe
+requires video transcode.
 
 ## How the Build Works
 

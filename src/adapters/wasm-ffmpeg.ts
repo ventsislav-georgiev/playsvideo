@@ -6,8 +6,10 @@ const audioJsUrl = new URL('../vendor/ffmpeg-core-audio/ffmpeg-core.js', import.
 const audioWasmUrl = new URL('../vendor/ffmpeg-core-audio/ffmpeg-core.wasm', import.meta.url).href;
 const fullJsUrl = new URL('../vendor/ffmpeg-core/ffmpeg-core.js', import.meta.url).href;
 const fullWasmUrl = new URL('../vendor/ffmpeg-core/ffmpeg-core.wasm', import.meta.url).href;
+const av1JsUrl = new URL('../vendor/ffmpeg-core-av1/ffmpeg-core.js', import.meta.url).href;
+const av1WasmUrl = new URL('../vendor/ffmpeg-core-av1/ffmpeg-core.wasm', import.meta.url).href;
 
-export type FfmpegTier = 'audio' | 'full';
+export type FfmpegTier = 'audio' | 'full' | 'av1';
 
 /** Full tier is used for codecs not present in the minimal audio bundle. */
 const FULL_TIER_ENABLED = true;
@@ -18,6 +20,7 @@ const AUDIO_TIER_CODECS = new Set(['ac3', 'eac3', 'dts', 'mp3', 'flac', 'opus'])
 const TIER_URLS: Record<FfmpegTier, { coreURL: string; wasmURL: string }> = {
   audio: { coreURL: audioJsUrl, wasmURL: audioWasmUrl },
   full: { coreURL: fullJsUrl, wasmURL: fullWasmUrl },
+  av1: { coreURL: av1JsUrl, wasmURL: av1WasmUrl },
 };
 
 /** Emscripten module interface returned by createFFmpegCore. */
@@ -41,7 +44,7 @@ let loadPromise: Promise<FFmpegCoreModule> | null = null;
 let pendingTier: FfmpegTier | null = null;
 
 /** Full is a superset of audio — never downgrade. */
-const TIER_RANK: Record<FfmpegTier, number> = { audio: 0, full: 1 };
+const TIER_RANK: Record<FfmpegTier, number> = { audio: 0, full: 1, av1: 2 };
 
 async function ensureTier(tier: FfmpegTier): Promise<FFmpegCoreModule> {
   if (tier === 'full' && !FULL_TIER_ENABLED) {
@@ -92,6 +95,7 @@ async function ensureTier(tier: FfmpegTier): Promise<FFmpegCoreModule> {
 }
 
 export function tierForCodec(codec: string): FfmpegTier {
+  if (codec === 'av1') return 'av1';
   return AUDIO_TIER_CODECS.has(codec) ? 'audio' : 'full';
 }
 

@@ -1,0 +1,226 @@
+# AV1-capable ffmpeg.wasm build — client-side AV1 decode → H.264/AAC encode
+#
+# This core is intentionally separate from the stock "full" core. The stock
+# @ffmpeg/core bundle can parse AV1 containers, but in wasm it does not include
+# a software AV1 decoder, so iPhone AV1 transcode fails with errors such as
+# "hardware accelerated AV1 decoding" / "Function not implemented".
+#
+# Build:
+#   docker buildx build -f ffmpegbuild/Dockerfile.ffmpeg-av1 -o ffmpegbuild/out-av1 .
+#
+# Install:
+#   mkdir -p src/vendor/ffmpeg-core-av1
+#   cp ffmpegbuild/out-av1/ffmpeg-core.{js,wasm} src/vendor/ffmpeg-core-av1/
+#
+# Output is still the @ffmpeg/ffmpeg 0.12.x-compatible createFFmpegCore module.
+
+FROM emscripten/emsdk:3.1.40 AS emsdk-base
+
+ARG FFMPEG_VERSION=n5.1.4
+ARG DAV1D_VERSION=1.4.3
+ARG X264_BRANCH=stable
+
+ENV CFLAGS="-O3 -msimd128"
+ENV CXXFLAGS="-O3 -msimd128"
+ENV LDFLAGS="-O3"
+ENV PKG_CONFIG_PATH="/opt/av1/lib/pkgconfig"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      meson \
+      ninja-build \
+      pkg-config \
+      python3 \
+      python3-pip \
+      yasm \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Build x264 (H.264 encoder) ----------
+FROM emsdk-base AS x264-builder
+
+RUN git clone --depth 1 --branch $X264_BRANCH https://code.videolan.org/videolan/x264.git /src/x264
+
+WORKDIR /src/x264
+
+RUN emconfigure ./configure \
+      --host=i686-gnu \
+      --prefix=/opt/av1 \
+      --enable-static \
+      --disable-cli \
+      --disable-asm \
+      --extra-cflags="$CFLAGS" \
+      --extra-ldflags="$LDFLAGS" \
+    && emmake make -j$(nproc) \
+    && emmake make install
+
+# ---------- Build dav1d (software AV1 decoder) ----------
+FROM emsdk-base AS dav1d-builder
+
+RUN git clone --depth 1 --branch $DAV1D_VERSION https://code.videolan.org/videolan/dav1d.git /src/dav1d
+
+WORKDIR /src/dav1d
+
+RUN cat > /tmp/emscripten-meson-cross.ini <<'EOF'
+[binaries]
+c = 'emcc'
+ar = 'emar'
+strip = 'emstrip'
+pkgconfig = 'pkg-config'
+
+[properties]
+needs_exe_wrapper = true
+
+[built-in options]
+c_args = ['-O3', '-msimd128']
+c_link_args = ['-O3']
+
+[host_machine]
+system = 'emscripten'
+cpu_family = 'wasm32'
+cpu = 'wasm32'
+endian = 'little'
+EOF
+
+RUN meson setup build \
+      --cross-file=/tmp/emscripten-meson-cross.ini \
+      --prefix=/opt/av1 \
+      --default-library=static \
+      --buildtype=release \
+      -Denable_tools=false \
+      -Denable_tests=false \
+      -Denable_examples=false \
+      -Denable_docs=false \
+      -Denable_asm=false \
+    && meson compile -C build \
+    && meson install -C build
+
+# ---------- Build FFmpeg libraries ----------
+FROM emsdk-base AS ffmpeg-builder
+
+COPY --from=x264-builder /opt/av1/ /opt/av1/
+COPY --from=dav1d-builder /opt/av1/ /opt/av1/
+
+RUN git clone --depth 1 --branch $FFMPEG_VERSION \
+      https://github.com/FFmpeg/FFmpeg.git /src/ffmpeg
+
+WORKDIR /src/ffmpeg
+
+RUN export PKG_CONFIG_PATH=/opt/av1/lib/pkgconfig \
+    PKG_CONFIG_LIBDIR=/opt/av1/lib/pkgconfig && \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'export PKG_CONFIG_PATH=/opt/av1/lib/pkgconfig' \
+      'export PKG_CONFIG_LIBDIR=/opt/av1/lib/pkgconfig' \
+      'exec pkg-config "$@"' \
+      > /tmp/av1-pkg-config && \
+    chmod +x /tmp/av1-pkg-config && \
+    pkg-config --modversion dav1d && \
+    pkg-config --cflags --libs dav1d && \
+    emconfigure ./configure \
+      --target-os=none \
+      --arch=x86_32 \
+      --enable-cross-compile \
+      --disable-asm \
+      --disable-stripping \
+      --disable-programs \
+      --disable-doc \
+      --disable-debug \
+      --disable-runtime-cpudetect \
+      --disable-autodetect \
+      --disable-pthreads \
+      --disable-w32threads \
+      --disable-os2threads \
+      --disable-everything \
+      --enable-gpl \
+      --enable-libdav1d \
+      --enable-libx264 \
+      --enable-decoder=libdav1d \
+      --enable-decoder=opus \
+      --enable-encoder=libx264 \
+      --enable-encoder=aac \
+      --enable-parser=av1 \
+      --enable-parser=opus \
+      --enable-parser=h264 \
+      --enable-parser=aac \
+      --enable-demuxer=mov \
+      --enable-demuxer=matroska \
+      --enable-muxer=mp4 \
+      --enable-muxer=mov \
+      --enable-protocol=file \
+      --enable-filter=buffer \
+      --enable-filter=buffersink \
+      --enable-filter=abuffer \
+      --enable-filter=abuffersink \
+      --enable-filter=format \
+      --enable-filter=aformat \
+      --enable-filter=anull \
+      --enable-filter=null \
+      --enable-filter=scale \
+      --enable-filter=aresample \
+      --enable-swscale \
+      --enable-swresample \
+      --nm=emnm \
+      --ar=emar \
+      --ranlib=emranlib \
+      --pkg-config=/tmp/av1-pkg-config \
+      --pkg-config-flags=--static \
+      --cc=emcc \
+      --cxx=em++ \
+      --objcc=emcc \
+      --dep-cc=emcc \
+      --extra-cflags="-I/opt/av1/include $CFLAGS" \
+      --extra-cxxflags="-I/opt/av1/include $CXXFLAGS" \
+      --extra-ldflags="-L/opt/av1/lib $LDFLAGS" \
+    || (cat ffbuild/config.log && exit 1) \
+    && emmake make -j$(nproc)
+
+# ---------- Link into WASM using upstream's fftools + JS bind layer ----------
+FROM emsdk-base AS ffmpeg-wasm-builder
+
+COPY --from=ffmpeg-builder /src/ffmpeg /src/ffmpeg
+COPY --from=ffmpeg-builder /opt/av1 /opt/av1
+
+RUN git clone --depth 1 https://github.com/ffmpegwasm/ffmpeg.wasm.git /src/ffmpeg-wasm
+
+WORKDIR /src/ffmpeg
+
+RUN mkdir -p src && \
+    cp -r /src/ffmpeg-wasm/src/fftools src/fftools && \
+    cp -r /src/ffmpeg-wasm/src/bind src/bind
+
+RUN mkdir -p /build/dist/esm && \
+    EXPORTED_FUNCTIONS=$(node src/bind/ffmpeg/export.js) && \
+    EXPORTED_RUNTIME_METHODS=$(node src/bind/ffmpeg/export-runtime.js) && \
+    emcc -O3 -msimd128 \
+      -I. \
+      -I/opt/av1/include \
+      -Isrc/fftools \
+      -Llibavdevice -Llibavfilter -Llibavformat -Llibavcodec \
+      -Llibswresample -Llibswscale -Llibpostproc -Llibavutil -L/opt/av1/lib \
+      src/fftools/cmdutils.c \
+      src/fftools/ffmpeg.c \
+      src/fftools/ffmpeg_filter.c \
+      src/fftools/ffmpeg_hw.c \
+      src/fftools/ffmpeg_mux.c \
+      src/fftools/ffmpeg_opt.c \
+      src/fftools/ffprobe.c \
+      src/fftools/opt_common.c \
+      -lavdevice -lavfilter -lavformat -lavcodec -lswresample -lswscale -lpostproc -lavutil \
+      -lx264 -ldav1d -lm \
+      -lworkerfs.js \
+      -sWASM_BIGINT \
+      -sSTACK_SIZE=5242880 \
+      -sMODULARIZE \
+      -sEXPORT_NAME="createFFmpegCore" \
+      -sEXPORT_ES6=1 \
+      -sENVIRONMENT=worker \
+      -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCTIONS" \
+      -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME_METHODS" \
+      -sINITIAL_MEMORY=67108864 \
+      -sALLOW_MEMORY_GROWTH=1 \
+      --pre-js src/bind/ffmpeg/bind.js \
+      -o /build/dist/esm/ffmpeg-core.js
+
+FROM scratch AS exportor
+COPY --from=ffmpeg-wasm-builder /build/dist/esm/ffmpeg-core.js /ffmpeg-core.js
+COPY --from=ffmpeg-wasm-builder /build/dist/esm/ffmpeg-core.wasm /ffmpeg-core.wasm

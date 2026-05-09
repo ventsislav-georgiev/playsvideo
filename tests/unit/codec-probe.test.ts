@@ -154,7 +154,7 @@ describe('codec-probe', () => {
       expect(spy).not.toHaveBeenCalled();
     });
 
-    it('chromium-like: avc supported, hevc not', () => {
+    it('chromium-like: avc supported, hevc not, AV1 remux pipeline unsafe', () => {
       mockMediaSource(
         new Set([
           'video/mp4; codecs="avc1.640028"',
@@ -165,8 +165,15 @@ describe('codec-probe', () => {
       const bp = createBrowserProber();
       expect(bp.canPlayVideo('avc')).toBe(true);
       expect(bp.canPlayVideo('vp9')).toBe(true);
-      expect(bp.canPlayVideo('av1')).toBe(true);
+      expect(bp.canPlayVideo('av1')).toBe(false);
       expect(bp.canPlayVideo('hevc')).toBe(false);
+    });
+
+    it('does not query MediaSource for AV1 because HLS remux uses client transcode', () => {
+      const spy = mockMediaSource(new Set(['video/mp4; codecs="av01.0.01M.08"']));
+      const bp = createBrowserProber();
+      expect(bp.canPlayVideo('av1')).toBe(false);
+      expect(spy).not.toHaveBeenCalledWith('video/mp4; codecs="av01.0.01M.08"');
     });
 
     it('safari-like: avc and hevc supported, vp9 and av1 not', () => {

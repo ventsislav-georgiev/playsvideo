@@ -188,6 +188,67 @@ describe('playback-selection', () => {
     expect(result.evaluations[0].diagnostics.map((d) => d.code)).toContain('hls-video-unsupported');
   });
 
+  it('keeps hls viable when unsupported AV1 video can be transcoded', () => {
+    const result = evaluatePlaybackOptions({
+      options: [{ mode: 'hls', id: 'hls' }],
+      media: {
+        sourceVideoCodec: 'av1',
+        sourceAudioCodec: 'opus',
+        videoCodec: 'av01.0.08M.08',
+        audioCodec: 'opus',
+      },
+      capabilities: {
+        hlsSupported: true,
+        pipelineProbe: {
+          canPlayVideo: () => false,
+          canPlayAudio: () => false,
+        },
+      },
+    });
+
+    expect(result.recommended?.option).toEqual({ mode: 'hls', id: 'hls' });
+    expect(result.evaluations[0].status).toBe('supported');
+    expect(result.evaluations[0].pipelineVideoSupported).toBe(false);
+    expect(result.evaluations[0].pipelineVideoRequiresTranscode).toBe(true);
+    expect(result.evaluations[0].pipelineAudioRequiresTranscode).toBe(true);
+    expect(result.evaluations[0].diagnostics.map((d) => d.code)).toEqual(
+      expect.arrayContaining(['hls-video-transcode', 'hls-audio-transcode']),
+    );
+  });
+
+  it('forces AV1 HLS pipeline video transcode even when direct AV1 may be supported', () => {
+    const result = evaluatePlaybackOptions({
+      options: [
+        { mode: 'direct-url', id: 'direct', mimeType: 'video/x-matroska', url: 'https://example.test/video.mkv' },
+        { mode: 'hls', id: 'hls' },
+      ],
+      media: {
+        sourceVideoCodec: 'av1',
+        sourceAudioCodec: 'opus',
+        videoCodec: 'av01.0.08M.08',
+        audioCodec: 'opus',
+        isAv1Video: true,
+      },
+      capabilities: {
+        canPlayType: () => '',
+        hlsSupported: true,
+        av1Supported: 'supported',
+        pipelineProbe: {
+          canPlayVideo: (codec) => codec !== 'av1',
+          canPlayAudio: () => false,
+        },
+      },
+    });
+
+    const hls = result.evaluations.find((entry) => entry.option.id === 'hls');
+    expect(result.recommended?.option).toEqual({ mode: 'hls', id: 'hls' });
+    expect(hls?.status).toBe('supported');
+    expect(hls?.pipelineVideoRequiresTranscode).toBe(true);
+    expect(hls?.diagnostics.map((d) => d.code)).toEqual(
+      expect.arrayContaining(['hls-video-transcode', 'hls-audio-transcode']),
+    );
+  });
+
   it('returns unknown when required metadata or capabilities are missing', () => {
     const result = evaluatePlaybackOptions({
       options: [

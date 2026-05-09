@@ -344,11 +344,14 @@ export class PlaysVideoEngine extends EventTarget {
   private _hlsMediaAttached = false;
   private _hlsManifestParsed = false;
   private _hlsSourceOpenFired = false;
+  private _hlsSourceOpenFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _deferredHlsStartPosition: number | null = null;
+  private _internalHlsSeekTarget: number | null = null;
 
   private _onVideoPause = (): void => {
     if (this.hls) {
       this.hls.stopLoad();
+      this._hlsLoadStarted = false;
       mlog('video paused → hls.stopLoad');
     }
     this.worker?.postMessage({ type: 'pause' });
@@ -362,6 +365,9 @@ export class PlaysVideoEngine extends EventTarget {
 
   private _onVideoPlay = (): void => {
     if (this.hls) {
+      if (!this._hlsLoadStarted && Number.isFinite(this.video.currentTime) && this.video.currentTime > 0) {
+        this._initialStartTimeSec = this.video.currentTime;
+      }
       this.tryStartHlsLoad('video play');
     }
     this.worker?.postMessage({ type: 'resume' });
@@ -402,14 +408,56 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.hls.startLoad(startPosition);
     this._hlsLoadStarted = true;
+    this.clearHlsSourceOpenFallback();
     mlog(`${reason} → hls.startLoad(${startPosition.toFixed(3)}) [sourceopen ready]`);
+  }
+
+  private scheduleHlsSourceOpenFallback(): void {
+    if (this._hlsSourceOpenFired || this._hlsSourceOpenFallbackTimer !== null) return;
+
+    this._hlsSourceOpenFallbackTimer = setTimeout(() => {
+      this._hlsSourceOpenFallbackTimer = null;
+      if (this._hlsSourceOpenFired || this._hlsLoadStarted) return;
+
+      this._hlsSourceOpenFired = true;
+      mlog('MediaSource sourceopen fallback fired');
+      this.tryStartHlsLoad('MediaSource sourceopen fallback');
+    }, 500);
+  }
+
+  private clearHlsSourceOpenFallback(): void {
+    if (this._hlsSourceOpenFallbackTimer === null) return;
+
+    clearTimeout(this._hlsSourceOpenFallbackTimer);
+    this._hlsSourceOpenFallbackTimer = null;
   }
 
 
   private _onVideoSeeked = (): void => {
     const seekTime = this.video.currentTime;
+    if (this.consumeInternalHlsSeek(seekTime)) {
+      mlog(`video seeked → t=${seekTime.toFixed(3)} from internal nudge; keep hls load active`);
+      return;
+    }
+
     mlog(`video seeked → t=${seekTime.toFixed(3)}, re-requesting embedded subtitles`);
     this.restartEmbeddedSubtitlesFromPosition(seekTime);
+
+    if (this.hls) {
+      if (Number.isFinite(seekTime) && seekTime > 0) {
+        this._initialStartTimeSec = seekTime;
+      }
+      if (this._hlsLoadStarted) {
+        this.hls.stopLoad();
+        this._hlsLoadStarted = false;
+        mlog(`video seeked → hls.stopLoad before restart at ${seekTime.toFixed(3)}`);
+      }
+      if (!this.video.paused) {
+        this.tryStartHlsLoad('video seeked');
+      } else {
+        mlog(`video seeked → deferred hls restart while paused at ${seekTime.toFixed(3)}`);
+      }
+    }
   };
 
   get phase(): EnginePhase {
@@ -686,6 +734,8 @@ export class PlaysVideoEngine extends EventTarget {
     this._segmentStates.clear();
     this._lastInternalErrorMessage = null;
     this._lastInternalErrorAt = 0;
+    this.clearHlsSourceOpenFallback();
+    this._internalHlsSeekTarget = null;
 
     this.dispatchEvent(new CustomEvent('loading', { detail }));
     this.dispatchSegmentStateChange();
@@ -857,6 +907,8 @@ export class PlaysVideoEngine extends EventTarget {
     this._lastInternalErrorAt = 0;
     this._initialStartTimeSec = null;
     this._hlsLoadStarted = false;
+    this.clearHlsSourceOpenFallback();
+    this._internalHlsSeekTarget = null;
     this.dispatchSegmentStateChange();
   }
 
@@ -932,7 +984,20 @@ export class PlaysVideoEngine extends EventTarget {
     this._hlsMediaAttached = false;
     this._hlsManifestParsed = false;
     this._hlsSourceOpenFired = false;
+    this.clearHlsSourceOpenFallback();
     this._deferredHlsStartPosition = null;
+    this._internalHlsSeekTarget = null;
+  }
+
+  private markInternalHlsSeekTarget(target: number): void {
+    this._internalHlsSeekTarget = target;
+  }
+
+  private consumeInternalHlsSeek(seekTime: number): boolean {
+    const target = this._internalHlsSeekTarget;
+    if (target === null) return false;
+    this._internalHlsSeekTarget = null;
+    return Math.abs(seekTime - target) <= 0.25;
   }
 
   private consumeHlsStartPosition(): number {
@@ -1299,6 +1364,11 @@ export class PlaysVideoEngine extends EventTarget {
   private async handleWorkerMessage(event: MessageEvent): Promise<void> {
     const msg = event.data;
 
+    if (msg.type === 'worker-log') {
+      mlog(`[worker] ${msg.message}`);
+      return;
+    }
+
     if (msg.type === 'probed') {
       // Worker finished demux — decide passthrough vs pipeline
       const media: PlaybackMediaMetadata = {
@@ -1382,7 +1452,7 @@ export class PlaysVideoEngine extends EventTarget {
         },
       };
 
-      mlog(`ready segments=${msg.totalSegments} dur=${msg.durationSec.toFixed(1)}s`);
+      mlog(`ready segments=${msg.totalSegments} dur=${msg.durationSec.toFixed(1)}s videoTranscodeEngine=${msg.videoTranscodeEngine ?? 'unknown'}`);
 
       // Resolve any pending requests
       if (this.pendingPlaylist) {
@@ -2149,6 +2219,7 @@ export class PlaysVideoEngine extends EventTarget {
     // Safari-critical: listen for sourceopen to gate HLS startup
     const onSourceOpen = () => {
       this._hlsSourceOpenFired = true;
+      this.clearHlsSourceOpenFallback();
       mlog('MediaSource sourceopen fired');
       this.tryStartHlsLoad('MediaSource sourceopen');
       // Remove listener after first fire
@@ -2161,6 +2232,7 @@ export class PlaysVideoEngine extends EventTarget {
     if (ms) {
       ms.addEventListener('sourceopen', onSourceOpen);
     }
+    this.scheduleHlsSourceOpenFallback();
 
     for (const evt of ['waiting', 'playing', 'emptied', 'abort'] as const) {
       this.video.addEventListener(evt, () => {
@@ -2203,6 +2275,7 @@ export class PlaysVideoEngine extends EventTarget {
                 mlog(
                   `stall-recovery: nudge ${ct.toFixed(3)}->${target.toFixed(3)} (gap=${(sb.start(i) - ct).toFixed(3)})`,
                 );
+                this.markInternalHlsSeekTarget(target);
                 this.video.currentTime = target;
                 stallCount = 0;
                 return;
@@ -2226,21 +2299,31 @@ export class PlaysVideoEngine extends EventTarget {
       stallCount = 0;
     });
 
+    let prevTotalFrames = 0;
     let prevDropped = 0;
+    let prevHealthWallTime = performance.now();
+    let prevHealthMediaTime = this.video.currentTime;
     const healthCheck = () => {
       if (!this.hls || this.video.paused) return;
       const q = this.video.getVideoPlaybackQuality?.();
       if (q) {
+        const now = performance.now();
+        const elapsedSec = Math.max((now - prevHealthWallTime) / 1000, 0.001);
+        const mediaDelta = this.video.currentTime - prevHealthMediaTime;
+        const totalDelta = q.totalVideoFrames - prevTotalFrames;
         const newDropped = q.droppedVideoFrames - prevDropped;
+        const fps = totalDelta / elapsedSec;
+        const mediaRate = mediaDelta / elapsedSec;
+        prevTotalFrames = q.totalVideoFrames;
         prevDropped = q.droppedVideoFrames;
+        prevHealthWallTime = now;
+        prevHealthMediaTime = this.video.currentTime;
         const sb = this.video.buffered;
         const ahead =
           sb.length > 0 ? (sb.end(sb.length - 1) - this.video.currentTime).toFixed(1) : '?';
-        if (newDropped > 0) {
-          mlog(
-            `health-check dropped=${newDropped} total=${q.totalVideoFrames} ahead=${ahead}s t=${this.video.currentTime.toFixed(3)}`,
-          );
-        }
+        mlog(
+          `health-check frames total=${q.totalVideoFrames} +${totalDelta} dropped=${q.droppedVideoFrames} +${newDropped} fps=${fps.toFixed(1)} mediaRate=${mediaRate.toFixed(2)} dt=${elapsedSec.toFixed(2)} dMedia=${mediaDelta.toFixed(3)} ahead=${ahead}s readyState=${this.video.readyState} t=${this.video.currentTime.toFixed(3)}`,
+        );
       }
     };
     setInterval(healthCheck, 2000);

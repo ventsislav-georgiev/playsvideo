@@ -1,7 +1,7 @@
 import {
   type AudioCodec,
   EncodedAudioPacketSource,
-  type EncodedPacket,
+  EncodedPacket,
   EncodedVideoPacketSource,
   Mp4OutputFormat,
   NullTarget,
@@ -29,7 +29,86 @@ export interface MuxResult {
 // values let Mediabunny split long segments into multiple internal fragments,
 // which hls.js can mishandle after seeks when appending passthrough fMP4.
 const SINGLE_HLS_FRAGMENT_DURATION_SEC = Number.MAX_SAFE_INTEGER;
+const AV1_OBU_SEQUENCE_HEADER = 1;
+const AV1_CONFIG_RECORD_HEADER_BYTES = 4;
+// ============================================================================
+// AV1 Sequence Header Helpers
+// ============================================================================
 
+/**
+ * Extract OBU type from the first byte of an OBU.
+ * OBU format: [obu_forbidden_bit(1) | obu_type(4) | obu_extension_flag(1) | obu_has_size_field(1) | obu_reserved_1bit(1)]
+ */
+function getObuType(byte: number): number | null {
+  if (typeof byte !== 'number' || byte < 0 || byte > 255) return null;
+  return (byte >> 3) & 0xf;
+}
+
+/**
+ * Check if a packet starts with an AV1 sequence header OBU (obu_type === 1).
+ */
+function hasAv1SequenceHeader(packet: Uint8Array): boolean {
+  if (!packet || packet.byteLength === 0) return false;
+  const obuType = getObuType(packet[0]);
+  return obuType === AV1_OBU_SEQUENCE_HEADER;
+}
+
+/**
+ * Extract AV1 sequence header from av1C box (decoderConfig.description).
+ * av1C format: [version(1) | seq_profile(3) | seq_level_idx_0(5) | seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) | monochrome(1) | chroma_subsampling_x(1) | chroma_subsampling_y(1) | chroma_sample_position(2) | reserved(3) | initial_presentation_delay_present(1) | initial_presentation_delay(4 or 0)]
+ * Followed by configOBUs (sequence header + other OBUs).
+ */
+function extractAv1SequenceHeaderFromConfig(description: Uint8Array): Uint8Array | null {
+  if (!description || description.byteLength <= AV1_CONFIG_RECORD_HEADER_BYTES) return null;
+  
+  const marker = (description[0] >> 7) & 0x01;
+  const version = description[0] & 0x7f;
+  if (marker !== 1 || version !== 1) return null;
+  
+  // Matroska CodecPrivate/av1C stores a fixed 4-byte config record before configOBUs.
+  const configOBUs = description.slice(AV1_CONFIG_RECORD_HEADER_BYTES);
+  return configOBUs.byteLength > 0 ? configOBUs : null;
+}
+
+/**
+ * Ensure AV1 packet has a sequence header OBU prepended if missing.
+ * If the packet already starts with a sequence header, return as-is.
+ * Otherwise, prepend the sequence header from decoderConfig.
+ */
+function ensureAv1SequenceHeader(
+  packet: Uint8Array,
+  decoderConfig: VideoDecoderConfig,
+): Uint8Array {
+  if (!packet || packet.byteLength === 0) return packet;
+  
+  // If packet already has sequence header, return as-is
+  if (hasAv1SequenceHeader(packet)) return packet;
+  
+  // Extract sequence header from decoderConfig
+  if (!decoderConfig.description) return packet;
+  
+  // Convert description to Uint8Array (handles both ArrayBuffer and SharedArrayBuffer)
+  const descriptionBytes = toUint8Array(decoderConfig.description);
+  
+  const seqHeader = extractAv1SequenceHeaderFromConfig(descriptionBytes);
+  if (!seqHeader || seqHeader.byteLength === 0) return packet;
+  
+  // Prepend sequence header to packet
+  const combined = new Uint8Array(seqHeader.byteLength + packet.byteLength);
+  combined.set(seqHeader, 0);
+  combined.set(packet, seqHeader.byteLength);
+  return combined;
+}
+
+function toUint8Array(buffer: AllowSharedBufferSource): Uint8Array {
+  if (buffer instanceof Uint8Array) return buffer;
+  if (ArrayBuffer.isView(buffer)) {
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  }
+  return new Uint8Array(buffer);
+}
+
+// ============================================================================
 function concatBuffers(arrays: Uint8Array[]): Uint8Array {
   const totalLength = arrays.reduce((sum, a) => sum + a.byteLength, 0);
   const result = new Uint8Array(totalLength);
@@ -380,7 +459,18 @@ export async function muxToFmp4(input: MuxInput): Promise<MuxResult> {
     decoderConfig: input.videoDecoderConfig,
   };
   for (let i = 0; i < input.videoPackets.length; i++) {
-    await videoSource.add(input.videoPackets[i], i === 0 ? videoMeta : undefined);
+    let packet = input.videoPackets[i];
+    
+    // AV1: Ensure sequence header is present in every packet
+    if (input.videoCodec === 'av1') {
+      const packetData = new Uint8Array(packet.data);
+      const hardened = ensureAv1SequenceHeader(packetData, input.videoDecoderConfig);
+      if (hardened !== packetData) {
+        packet = new EncodedPacket(hardened, packet.type, packet.timestamp, packet.duration);
+      }
+    }
+    
+    await videoSource.add(packet, i === 0 ? videoMeta : undefined);
   }
 
   // Feed audio packets — pass decoder config on first packet

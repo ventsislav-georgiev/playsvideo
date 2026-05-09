@@ -23,7 +23,7 @@
     "dev": "vite",
     "build": "pnpm run build:site && pnpm run build:lib",
     "build:site": "vite build",
-    "build:lib": "rm -rf dist && tsc -p tsconfig.lib.json && mkdir -p dist/vendor && cp -r src/vendor/ffmpeg-core-audio dist/vendor/ffmpeg-core-audio",
+    "build:lib": "rm -rf dist && tsc -p tsconfig.lib.json && mkdir -p dist/vendor && cp -r src/vendor/ffmpeg-core-audio src/vendor/ffmpeg-core src/vendor/ffmpeg-core-av1 src/vendor/dav1d src/vendor/dav1d-bridge dist/vendor/",
     "build:bundle": "vite build --config vite.config.bundle.ts",
     "build:extension": "vite build --config vite.config.extension.ts",
     "test": "vitest run",
@@ -47,6 +47,7 @@
     "test:sync": "FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 vitest run tests/unit/sync"
   },
   "dependencies": {
+    "dav1d.js": "^0.1.1",
     "hls.js": "file:../hls.js",
     "mediabunny": "file:../mediabunny"
   },

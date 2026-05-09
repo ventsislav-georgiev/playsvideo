@@ -25,6 +25,8 @@ import {
   buildMkvKeyframeIndexFromUrl,
 } from './pipeline/mkv-keyframe-index.js';
 import { generateVodPlaylist } from './pipeline/playlist.js';
+import { checkDav1dBridgeAv1Compatibility } from './pipeline/av1-packet-builder.js';
+import { createDav1dWebCodecsVideoTranscoder } from './pipeline/dav1d-video-transcode.js';
 import { buildSegmentPlan } from './pipeline/segment-plan.js';
 import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import { isAbortableSource } from './pipeline/source-signal.js';
@@ -38,6 +40,19 @@ import type {
   TranscodeJobResponse,
   TranscodePortMessage,
 } from './transcode-protocol.js';
+import {
+  createLocalVideoTranscoder,
+  isVideoTranscodeInputSupported,
+  makeVideoTranscodeAudioDecoderConfig,
+  VIDEO_TRANSCODE_OUTPUT_AUDIO_CODEC,
+  VIDEO_TRANSCODE_OUTPUT_CODEC,
+  VIDEO_TRANSCODE_OUTPUT_CODEC_FULL,
+} from './pipeline/video-transcode.js';
+import {
+  H264_WEB_CODECS_CODEC,
+  formatWebCodecsTranscodeProbe,
+  probeWebCodecsTranscodeSupport,
+} from './pipeline/webcodecs-transcode-probe.js';
 import type {
   WorkerSegmentPhase,
   WorkerSegmentStateMessage,
@@ -47,6 +62,11 @@ import type {
 
 function wlog(msg: string) {
   console.log(`[worker] ${msg}`);
+  try {
+    self.postMessage({ type: 'worker-log', message: msg });
+  } catch {
+    // Best-effort diagnostics only.
+  }
 }
 
 function elapsed(start: number): string {
@@ -321,22 +341,31 @@ class TranscodePortPool {
 const ffmpeg = new WasmFfmpegRunner();
 const codecProber = createBrowserProber();
 const localAudioTranscoder = createLocalAudioTranscoder(ffmpeg);
+const localVideoTranscoder = createLocalVideoTranscoder(ffmpeg);
 const transcodePool = new TranscodePortPool(localAudioTranscoder);
 
 let demux: DemuxResult | null = null;
 let plan: PlannedSegment[] = [];
 let resolveSegmentBoundary: ReturnType<typeof createVideoBoundaryResolver> | null = null;
 let doTranscode = false;
+let doVideoTranscode = false;
+let activeVideoTranscoder = localVideoTranscoder;
+let prepareAudioForVideoTranscode = false;
+let outputVideoCodecFull = VIDEO_TRANSCODE_OUTPUT_CODEC_FULL;
+let videoTranscodeEngine: 'none' | 'ffmpeg' | 'dav1d-webcodecs' = 'none';
 let audioDecoderConfig: AudioDecoderConfig | null = null;
 let initSegment: Uint8Array | null = null;
 let currentBlob: Blob | null = null;
 let currentUrl: string | null = null;
 let currentSource: AbortableUrlSource | null = null;
-const SEGMENT_TIMEOUT_MS = 60_000;
+const SEGMENT_TIMEOUT_MS = 120_000;
 const segmentCache = new Map<number, Uint8Array>();
 const segmentTasks = new Map<number, Promise<Uint8Array>>();
+const segmentTaskAbortControllers = new Map<number, AbortController>();
+const segmentTaskAbortReasons = new Map<number, 'cancel' | 'external' | 'timeout'>();
 const prefetchTaskIndexes = new Set<number>();
 let targetSegDuration = 4;
+const VIDEO_TRANSCODE_PREFETCH_AHEAD_SEGMENTS = 3;
 
 // Keep pipeline setup ordered, but let individual segment work run independently.
 let pipelineSetup: Promise<void> = Promise.resolve();
@@ -434,6 +463,9 @@ self.onmessage = (event: MessageEvent) => {
 
   if (msg.type === 'open') {
     wlog('recv open');
+    paused = false;
+    prefetchAbort?.abort();
+    prefetchAbort = null;
     targetSegDuration = msg.targetSegmentDuration ?? 4;
     currentBlob = msg.file;
     currentUrl = null;
@@ -441,6 +473,9 @@ self.onmessage = (event: MessageEvent) => {
     queuePipelineSetup(() => handleProbe(() => demuxBlob(msg.file)));
   } else if (msg.type === 'open-url') {
     wlog('recv open-url');
+    paused = false;
+    prefetchAbort?.abort();
+    prefetchAbort = null;
     targetSegDuration = msg.targetSegmentDuration ?? 4;
     currentBlob = null;
     currentUrl = msg.url;
@@ -476,6 +511,7 @@ self.onmessage = (event: MessageEvent) => {
       controller.abort();
       segmentAbortControllers.delete(msg.index);
     }
+    abortSegmentTask(msg.index, 'cancel');
   } else if (msg.type === 'pause') {
     paused = true;
     if (prefetchAbort) {
@@ -530,9 +566,18 @@ function makeProcessorConfig() {
     doTranscode,
     transcodeAudio: transcodePool.hasWorkers() ? transcodePool.transcode : localAudioTranscoder,
     sourceCodec: demux.audioCodec ?? undefined,
+    videoTranscode: doVideoTranscode,
+    transcodeVideo: activeVideoTranscoder,
+    prepareAudioForVideoTranscode,
+    sourceVideoCodec: demux.videoCodec,
+    sourceVideoDecoderConfig: demux.videoDecoderConfig,
     resolveSegmentBoundary: resolveSegmentBoundary ?? undefined,
     log: wlog,
   };
+}
+
+function videoTrackRequiresTranscode(demux: DemuxResult): boolean {
+  return !codecProber.canPlayVideo(demux.videoCodec, demux.videoDecoderConfig.codec);
 }
 
 function requireSupportedAudioCodec(demux: DemuxResult): string | null {
@@ -555,10 +600,10 @@ function audioTrackRequiresTranscode(demux: DemuxResult): boolean {
 }
 
 function shouldPrefetchSegments(): boolean {
-  return doTranscode && transcodePool.workerCount() > 0;
+  return doVideoTranscode || (doTranscode && transcodePool.workerCount() > 0);
 }
 
-function schedulePrefetch(startIndex: number): void {
+function schedulePrefetch(startIndex: number, stopBeforeIndex?: number): void {
   if (paused || !shouldPrefetchSegments()) {
     return;
   }
@@ -567,13 +612,21 @@ function schedulePrefetch(startIndex: number): void {
   const signal = prefetchAbort.signal;
 
   const maxInFlight = currentSource ? 1 : transcodePool.workerCount();
+  const prefetchStopBeforeIndex = doVideoTranscode
+    ? (stopBeforeIndex ?? startIndex + VIDEO_TRANSCODE_PREFETCH_AHEAD_SEGMENTS)
+    : plan.length;
   let nextIndex = startIndex;
-  while (segmentTasks.size < maxInFlight && nextIndex < plan.length) {
+  while (
+    segmentTasks.size < maxInFlight &&
+    nextIndex < plan.length &&
+    nextIndex < prefetchStopBeforeIndex
+  ) {
     if (!segmentCache.has(nextIndex) && !segmentTasks.has(nextIndex)) {
       emitSegmentState(nextIndex, 'prefetching');
       const prefetchIndex = nextIndex;
       prefetchTaskIndexes.add(prefetchIndex);
-      void ensureSegmentTask(nextIndex, signal)
+      const prefetchSignal = doVideoTranscode ? undefined : signal;
+      void ensureSegmentTask(nextIndex, prefetchSignal)
         .catch((err) => {
           if (err instanceof DOMException && err.name === 'AbortError') return;
           emitSegmentState(nextIndex, 'error', { message: String(err) });
@@ -581,6 +634,9 @@ function schedulePrefetch(startIndex: number): void {
         })
         .finally(() => {
           prefetchTaskIndexes.delete(prefetchIndex);
+          if (doVideoTranscode && !paused) {
+            schedulePrefetch(prefetchIndex + 1, prefetchStopBeforeIndex);
+          }
         });
     }
     nextIndex += 1;
@@ -605,27 +661,34 @@ async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<U
 
   const existing = segmentTasks.get(index);
   if (existing) {
+    linkSegmentTaskAbort(index, signal, existing);
     return existing;
   }
+
+  const taskCtrl = new AbortController();
+  segmentTaskAbortControllers.set(index, taskCtrl);
+  const unlinkExternalAbort = linkAbortSignal(signal, taskCtrl, () => {
+    segmentTaskAbortReasons.set(index, 'external');
+  });
 
   const task = (async () => {
     const t0 = performance.now();
     emitSegmentState(index, 'processing');
 
     // Timeout prevents indefinite hangs (e.g. ffmpeg.wasm stalling)
-    const timeoutCtrl = new AbortController();
-    const timeoutId = setTimeout(() => timeoutCtrl.abort(), SEGMENT_TIMEOUT_MS);
-    const onExternalAbort = () => timeoutCtrl.abort();
-    signal?.addEventListener('abort', onExternalAbort, { once: true });
+    const timeoutId = setTimeout(() => {
+      segmentTaskAbortReasons.set(index, 'timeout');
+      taskCtrl.abort();
+    }, SEGMENT_TIMEOUT_MS);
 
     let result: Awaited<ReturnType<typeof processSegmentWithAbort>>;
     try {
       if (currentSource && isAbortableSource(currentSource)) {
-        currentSource.setCurrentSignal(timeoutCtrl.signal);
+        currentSource.setCurrentSignal(taskCtrl.signal);
       }
-      result = await processSegmentWithAbort(makeProcessorConfig(), index, timeoutCtrl.signal);
+      result = await processSegmentWithAbort(makeProcessorConfig(), index, taskCtrl.signal);
     } catch (err) {
-      if (!signal?.aborted && timeoutCtrl.signal.aborted) {
+      if (taskCtrl.signal.aborted && segmentTaskAbortReasons.get(index) === 'timeout') {
         wlog(`seg ${index} timed out after ${SEGMENT_TIMEOUT_MS}ms`);
       }
       throw err;
@@ -634,7 +697,7 @@ async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<U
         currentSource.setCurrentSignal(null);
       }
       clearTimeout(timeoutId);
-      signal?.removeEventListener('abort', onExternalAbort);
+      unlinkExternalAbort();
     }
 
     if (!initSegment && result.initSegment) {
@@ -649,10 +712,48 @@ async function ensureSegmentTask(index: number, signal?: AbortSignal): Promise<U
     return mediaData;
   })().finally(() => {
     segmentTasks.delete(index);
+    segmentTaskAbortControllers.delete(index);
+    segmentTaskAbortReasons.delete(index);
   });
 
   segmentTasks.set(index, task);
   return task;
+}
+
+function abortSegmentTask(index: number, reason: 'cancel' | 'external' | 'timeout'): void {
+  const controller = segmentTaskAbortControllers.get(index);
+  if (!controller || controller.signal.aborted) return;
+  segmentTaskAbortReasons.set(index, reason);
+  controller.abort();
+}
+
+function linkAbortSignal(
+  signal: AbortSignal | undefined,
+  controller: AbortController,
+  beforeAbort?: () => void,
+): () => void {
+  if (!signal) return () => {};
+  if (signal.aborted) {
+    beforeAbort?.();
+    controller.abort();
+    return () => {};
+  }
+
+  const abort = () => {
+    beforeAbort?.();
+    controller.abort();
+  };
+  signal.addEventListener('abort', abort, { once: true });
+  return () => signal.removeEventListener('abort', abort);
+}
+
+function linkSegmentTaskAbort(index: number, signal: AbortSignal | undefined, task: Promise<Uint8Array>): void {
+  const controller = segmentTaskAbortControllers.get(index);
+  if (!controller) return;
+  const unlink = linkAbortSignal(signal, controller, () => {
+    segmentTaskAbortReasons.set(index, 'external');
+  });
+  void task.finally(unlink).catch(() => {});
 }
 
 async function waitForSegment(index: number, signal?: AbortSignal): Promise<Uint8Array> {
@@ -660,7 +761,7 @@ async function waitForSegment(index: number, signal?: AbortSignal): Promise<Uint
     throw makeAbortError();
   }
 
-  const task = ensureSegmentTask(index);
+  const task = ensureSegmentTask(index, signal);
   if (!signal) {
     return task;
   }
@@ -749,16 +850,61 @@ async function handleRemuxPipeline(
   resolveSegmentBoundary = createVideoBoundaryResolver(demux.videoSink, plan, wlog);
   wlog(`segment-plan done ${elapsed(tPlan)} segments=${plan.length}`);
 
-  doTranscode = audioTrackRequiresTranscode(demux);
+  doVideoTranscode = videoTrackRequiresTranscode(demux);
+  if (doVideoTranscode && !isVideoTranscodeInputSupported(demux.videoCodec)) {
+    throw new Error(`Unsupported video transcode source codec: ${demux.videoCodec}`);
+  }
+  if (doVideoTranscode) {
+    const webCodecsProbe = await probeWebCodecsTranscodeSupport(demux.videoDecoderConfig);
+    wlog(`webcodecs transcode probe ${formatWebCodecsTranscodeProbe(webCodecsProbe)}`);
+    const dav1dCompatibility = demux.videoCodec === 'av1'
+      ? checkDav1dBridgeAv1Compatibility(demux.videoDecoderConfig.description)
+      : { compatible: false, reason: 'non-av1' };
+    const canUseDav1dWebCodecs = webCodecsProbe.available
+      && webCodecsProbe.h264Encode.supported
+      && dav1dCompatibility.compatible;
+    if (demux.videoCodec === 'av1' && !dav1dCompatibility.compatible) {
+      wlog(`dav1d-webcodecs skipped reason=${dav1dCompatibility.reason ?? 'unknown'}`);
+    }
+    activeVideoTranscoder = canUseDav1dWebCodecs
+      ? createDav1dWebCodecsVideoTranscoder({ h264Codec: webCodecsProbe.h264Codec })
+      : localVideoTranscoder;
+    prepareAudioForVideoTranscode = canUseDav1dWebCodecs && !!demux.audioTrack && demux.audioCodec !== 'aac';
+    outputVideoCodecFull = canUseDav1dWebCodecs ? webCodecsProbe.h264Codec : VIDEO_TRANSCODE_OUTPUT_CODEC_FULL;
+    videoTranscodeEngine = canUseDav1dWebCodecs ? 'dav1d-webcodecs' : 'ffmpeg';
+    wlog(
+      `video transcode enabled source=${demux.videoCodec} output=${VIDEO_TRANSCODE_OUTPUT_CODEC} engine=${videoTranscodeEngine} h264=${outputVideoCodecFull}`,
+    );
+    if (!canUseDav1dWebCodecs) {
+      await ffmpeg.loadForCodec(demux.videoCodec);
+    } else if (prepareAudioForVideoTranscode) {
+      const sourceAudioCodec = requireSupportedAudioCodec(demux);
+      if (!sourceAudioCodec || !isAudioTranscodeInputSupported(sourceAudioCodec)) {
+        throw new Error(`Unsupported audio transcode source codec: ${sourceAudioCodec ?? 'unknown'}`);
+      }
+      if (!transcodePool.hasWorkers()) {
+        await ffmpeg.loadForCodec(sourceAudioCodec);
+      }
+    }
+  } else {
+    activeVideoTranscoder = localVideoTranscoder;
+    prepareAudioForVideoTranscode = false;
+    outputVideoCodecFull = VIDEO_TRANSCODE_OUTPUT_CODEC_FULL;
+    videoTranscodeEngine = 'none';
+  }
+
+  doTranscode = !doVideoTranscode && audioTrackRequiresTranscode(demux);
   if (doTranscode && demux.audioCodec && !isAudioTranscodeInputSupported(demux.audioCodec)) {
     throw new Error(`Unsupported audio transcode source codec: ${demux.audioCodec}`);
   }
   if (doTranscode && demux.audioCodec && !transcodePool.hasWorkers()) {
     await ffmpeg.loadForCodec(demux.audioCodec);
   }
-  audioDecoderConfig = doTranscode
-    ? makeAacDecoderConfig(demux.audioDecoderConfig)
-    : demux.audioDecoderConfig;
+  audioDecoderConfig = doVideoTranscode
+    ? (demux.audioTrack ? makeVideoTranscodeAudioDecoderConfig(demux.audioDecoderConfig) : null)
+    : doTranscode
+      ? makeAacDecoderConfig(demux.audioDecoderConfig)
+      : demux.audioDecoderConfig;
   initSegment = null;
   segmentCache.clear();
   segmentTasks.clear();
@@ -795,16 +941,27 @@ async function handleRemuxPipeline(
       sourceVideoCodecFull: demux.videoDecoderConfig.codec,
       sourceAudioCodec: demux.audioCodec,
       sourceAudioCodecFull: demux.audioDecoderConfig?.codec ?? null,
-      outputVideoCodec: demux.videoCodec,
-      outputVideoCodecFull: demux.videoDecoderConfig.codec,
-      outputAudioCodec: doTranscode ? 'aac' : demux.audioCodec,
+      outputVideoCodec: doVideoTranscode ? VIDEO_TRANSCODE_OUTPUT_CODEC : demux.videoCodec,
+      outputVideoCodecFull: doVideoTranscode
+        ? outputVideoCodecFull
+        : demux.videoDecoderConfig.codec,
+      videoTranscodeEngine,
+      outputAudioCodec: doVideoTranscode
+        ? (demux.audioTrack ? VIDEO_TRANSCODE_OUTPUT_AUDIO_CODEC : null)
+        : doTranscode
+          ? 'aac'
+          : demux.audioCodec,
       outputAudioCodecFull: audioDecoderConfig?.codec ?? null,
       subtitleTracks: demux.subtitleTracks,
     },
     { transfer: [] },
   ); // don't transfer initData — we need to keep it
 
-  schedulePrefetch(initialSegmentIndex !== null && initialSegmentIndex > 0 ? initialSegmentIndex : 1);
+  if (doVideoTranscode) {
+    wlog('video-transcode prefetch deferred until first segment delivery');
+  } else {
+    schedulePrefetch(initialSegmentIndex !== null && initialSegmentIndex > 0 ? initialSegmentIndex : 1);
+  }
 }
 
 function findSegmentIndexForTime(timeSec: unknown): number | null {

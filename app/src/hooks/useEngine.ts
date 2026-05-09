@@ -58,6 +58,7 @@ interface UseEngineResult {
   clearExternalSubtitles: () => void;
   copyDiagnostics: () => Promise<void>;
   diagnosticsStatus: string;
+  av1WarningMessage: string;
   savePosition: (reason?: SaveReason) => Promise<void>;
   // Phase 2a: Subtitle seeking capability
   subtitleSeekingCapability: SubtitleSeekingCapability | null;
@@ -149,6 +150,7 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
   const [hasEnded, setHasEnded] = useState(false);
   const [subtitleStatus, setSubtitleStatus] = useState('');
   const [diagnosticsStatus, setDiagnosticsStatus] = useState('');
+  const [av1WarningMessage, setAv1WarningMessage] = useState('');
   const [needsPermission, setNeedsPermission] = useState(false);
   const [retryCounter, setRetryCounter] = useState(0);
   const [embeddedSubtitlePolicy] = useSetting<EmbeddedSubtitlePolicy>(
@@ -259,6 +261,7 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
 
     const label = entry ? `${entry.name} (${entry.path})` : file!.name;
     pushDiagnosticEvent(diagnosticsRef, 'session:start', label);
+    setAv1WarningMessage('');
 
     engine.addEventListener('loading', ((e: CustomEvent) => {
       setStatus(`Opening ${e.detail.file?.name ?? ''}...`);
@@ -354,6 +357,18 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
           })),
         }),
       );
+
+      // Extract AV1 warning from diagnostics
+      const av1Diagnostics = e.detail.evaluation?.evaluations
+        ?.flatMap((eval: any) => eval.diagnostics ?? [])
+        .filter((diag: any) => diag.code?.startsWith('hls-av1-')) ?? [];
+      
+      if (av1Diagnostics.length > 0) {
+        const av1Diag = av1Diagnostics[0];
+        setAv1WarningMessage(av1Diag.message ?? '');
+      } else {
+        setAv1WarningMessage('');
+      }
     }) as EventListener);
 
     engine.addEventListener('workerstatechange', ((e: CustomEvent) => {
@@ -625,5 +640,6 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     subtitleSeekingCapability: subtitleSeekingState.capability,
     seekSubtitle,
     subtitleSeekingStatus: subtitleSeekingState.status,
+    av1WarningMessage,
   };
 }

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AbortableUrlSource } from '../../src/pipeline/demux.js';
 
-function installRangeFetchMock(data: Uint8Array, options?: { supportsRange?: boolean }): string[] {
+const SIZE_PROBE_RANGE = 'bytes=0-65535';
+
+function installRangeFetchMock(data: Uint8Array, options?: { supportsRange?: boolean; hideContentRangeOnOpenEndedRange?: boolean }): string[] {
   const requests: string[] = [];
   const supportsRange = options?.supportsRange !== false;
 
@@ -21,9 +23,18 @@ function installRangeFetchMock(data: Uint8Array, options?: { supportsRange?: boo
     const range = new Headers(init?.headers).get('range');
     requests.push(range ?? 'none');
 
-    // Non-offline size detection request: Range: bytes=0-
-    if (range === 'bytes=0-') {
+    // Non-offline size detection request: small bounded range.
+    if (range === SIZE_PROBE_RANGE) {
       if (supportsRange) {
+        if (options?.hideContentRangeOnOpenEndedRange) {
+          const end = Math.min(65535, data.byteLength - 1);
+          return new Response(data.slice(0, end + 1), {
+            status: 206,
+            headers: {
+              'content-length': String(end + 1),
+            },
+          });
+        }
         // Server supports ranges: return 206 with Content-Range
         return new Response(data.slice(0, Math.min(65536, data.byteLength)), {
           status: 206,
@@ -68,7 +79,7 @@ describe('AbortableUrlSource', () => {
     vi.restoreAllMocks();
   });
 
-  it('detects file size using Range: bytes=0- with 206 response', async () => {
+  it('detects file size using a bounded range with 206 response', async () => {
     const data = new Uint8Array(1024 * 1024);
     const requests = installRangeFetchMock(data, { supportsRange: true });
 
@@ -76,7 +87,23 @@ describe('AbortableUrlSource', () => {
     const size = await source._retrieveSize();
 
     expect(size).toBe(1024 * 1024);
-    expect(requests[0]).toBe('bytes=0-');
+    expect(requests[0]).toBe(SIZE_PROBE_RANGE);
+  });
+
+  it('falls back to HEAD when bounded 206 hides Content-Range', async () => {
+    const data = new Uint8Array(1024 * 1024);
+    data.forEach((_, index) => {
+      data[index] = index % 251;
+    });
+    const requests = installRangeFetchMock(data, { supportsRange: true, hideContentRangeOnOpenEndedRange: true });
+
+    const source = new AbortableUrlSource('https://example.test/video.mkv');
+    const size = await source._retrieveSize();
+    const cached = await source._read(1000, 2000);
+
+    expect(size).toBe(1024 * 1024);
+    expect(Array.from(cached.bytes)).toEqual(Array.from(data.slice(1000, 2000)));
+    expect(requests).toEqual([SIZE_PROBE_RANGE, 'HEAD']);
   });
 
   it('detects file size using Content-Length with 200 response', async () => {
@@ -87,7 +114,7 @@ describe('AbortableUrlSource', () => {
     const size = await source._retrieveSize();
 
     expect(size).toBe(1024 * 1024);
-    expect(requests[0]).toBe('bytes=0-');
+    expect(requests[0]).toBe(SIZE_PROBE_RANGE);
   });
 
   it('caches initial chunk from size detection for reuse', async () => {
@@ -105,7 +132,7 @@ describe('AbortableUrlSource', () => {
     expect(Array.from(cached.bytes)).toEqual(Array.from(data.slice(1000, 2000)));
 
     // Should only have the size detection request, not a separate read request
-    expect(requests).toEqual(['bytes=0-']);
+    expect(requests).toEqual([SIZE_PROBE_RANGE]);
   });
 
   it('fetches chunk-aligned read-ahead windows for offline video URLs and serves later reads from cache', async () => {
@@ -148,8 +175,8 @@ describe('AbortableUrlSource', () => {
     expect(requests).toEqual(['HEAD', 'bytes=0-524287', 'bytes=524288-1048575']);
   });
 
-  it('keeps exact byte ranges for non-offline URLs', async () => {
-    const data = new Uint8Array(1024 * 1024);
+  it('fetches read-ahead windows for non-offline URLs and serves later reads from cache', async () => {
+    const data = new Uint8Array(12 * 1024 * 1024);
     const requests = installRangeFetchMock(data, { supportsRange: true });
 
     const source = new AbortableUrlSource('https://example.test/video.mkv');
@@ -157,10 +184,11 @@ describe('AbortableUrlSource', () => {
 
     await source._read(10_000, 10_064);
     await source._read(250_000, 250_128);
+    await source._read(9_000_000, 9_000_128);
 
-    // Size detection + one exact range request
-    // First read (10_000-10_064) is served from cached initial chunk (0-65536)
-    // Second read (250_000-250_128) requires a separate request
-    expect(requests).toEqual(['bytes=0-', 'bytes=250000-250127']);
+    // Size detection + 8 MiB read-ahead windows for online sparse reads.
+    // First read (10_000-10_064) is served from cached initial chunk (0-65536).
+    // Second read fills the first online window; third read fills the second.
+    expect(requests).toEqual([SIZE_PROBE_RANGE, 'bytes=0-8388607', 'bytes=8388608-12582911']);
   });
 });
