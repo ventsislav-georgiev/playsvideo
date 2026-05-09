@@ -1903,14 +1903,24 @@ export class PlaysVideoEngine extends EventTarget {
       enableWorker: false,
       autoStartLoad: false,
       preferManagedMediaSource: false,
-      maxBufferLength: 15,
-      maxMaxBufferLength: 30,
+      // VOD buffering tuning for slow-generated segments:
+      // Increased from 15s to 60s to tolerate segment generation latency.
+      maxBufferLength: 60,
+      // Increased from 30s to 300s to allow aggressive prefetch without stalling playback.
+      maxMaxBufferLength: 300,
+      // Cap total buffered data at 100MB to prevent memory bloat on long VODs.
+      maxBufferSize: 100 * 1000 * 1000,
+      // Increased from default 8s to allow slower segment delivery without triggering stall recovery.
+      maxLoadingDelay: 8,
+      // Enable progressive loading to start playback sooner without waiting for full buffer.
+      progressive: true,
       backBufferLength: 30,
       maxBufferHole: 0.5,
       nudgeOffset: 0.1,
       nudgeMaxRetry: 6,
       highBufferWatchdogPeriod: 1,
     });
+
 
     this.hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
       mlog(`hls MANIFEST_PARSED levels=${data.levels.length}`);
