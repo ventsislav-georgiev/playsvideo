@@ -19,6 +19,7 @@ import {
   type PlaybackOption,
   type PlaybackOptionEvaluation,
 } from './playback-selection.js';
+import { getAv1Fallback, getAv1UnsupportedMessage, getAv1MalformedMessage, detectAv1Support, validateAv1Metadata } from './av1-capability.js';
 import {
   createLocalAudioTranscoder,
   isAudioTranscodeInputSupported,
@@ -334,11 +335,16 @@ export class PlaysVideoEngine extends EventTarget {
   private _sourcePrefetchIndex: number | null = null;
   private _sourcePlaybackOptions: PlaybackOption[] | null = null;
   private _sourcePreferenceOrder: PlaybackMode[] | null = null;
+  private _av1Support?: 'supported' | 'unsupported' | 'unknown';
   private _sourcePlaybackPolicy: PlaybackPolicy = 'auto';
   private _lastInternalErrorMessage: string | null = null;
   private _lastInternalErrorAt = 0;
   private _initialStartTimeSec: number | null = null;
   private _hlsLoadStarted = false;
+  private _hlsMediaAttached = false;
+  private _hlsManifestParsed = false;
+  private _hlsSourceOpenFired = false;
+  private _deferredHlsStartPosition: number | null = null;
 
   private _onVideoPause = (): void => {
     if (this.hls) {
@@ -356,12 +362,49 @@ export class PlaysVideoEngine extends EventTarget {
 
   private _onVideoPlay = (): void => {
     if (this.hls) {
-      const startPosition = this.consumeHlsStartPosition();
-      this.hls.startLoad(startPosition);
-      mlog(`video play → hls.startLoad(${startPosition.toFixed(3)})`);
+      this.tryStartHlsLoad('video play');
     }
     this.worker?.postMessage({ type: 'resume' });
   };
+
+  private applyHlsStartPositionToMedia(startPosition: number, reason: string): void {
+    if (!Number.isFinite(startPosition) || startPosition <= 0) return;
+    if (Math.abs(this.video.currentTime - startPosition) <= 0.5) return;
+
+    try {
+      this.video.currentTime = startPosition;
+      mlog(`${reason} → set currentTime=${startPosition.toFixed(3)} for HLS resume`);
+    } catch (err) {
+      mlog(`${reason} → failed to set currentTime=${startPosition.toFixed(3)}: ${String(err)}`);
+    }
+  }
+
+  private tryStartHlsLoad(reason: string): void {
+    if (!this.hls || this._hlsLoadStarted) return;
+    if (!this._hlsMediaAttached || !this._hlsManifestParsed) {
+      mlog(
+        `${reason} → defer hls.startLoad mediaAttached=${this._hlsMediaAttached} manifestParsed=${this._hlsManifestParsed}`,
+      );
+      return;
+    }
+
+    // Safari-critical: defer seek until sourceopen
+    if (!this._hlsSourceOpenFired) {
+      mlog(`${reason} → defer hls.startLoad until sourceopen`);
+      return;
+    }
+
+    const startPosition = this.consumeHlsStartPosition();
+    this._deferredHlsStartPosition = startPosition;
+
+    // Apply seek AFTER sourceopen but BEFORE startLoad
+    this.applyHlsStartPositionToMedia(startPosition, `${reason} (post-sourceopen)`);
+
+    this.hls.startLoad(startPosition);
+    this._hlsLoadStarted = true;
+    mlog(`${reason} → hls.startLoad(${startPosition.toFixed(3)}) [sourceopen ready]`);
+  }
+
 
   private _onVideoSeeked = (): void => {
     const seekTime = this.video.currentTime;
@@ -886,6 +929,10 @@ export class PlaysVideoEngine extends EventTarget {
   private setInitialStartTime(value: number | undefined): void {
     this._initialStartTimeSec = Number.isFinite(value) && value! > 0 ? Math.max(0, value!) : null;
     this._hlsLoadStarted = false;
+    this._hlsMediaAttached = false;
+    this._hlsManifestParsed = false;
+    this._hlsSourceOpenFired = false;
+    this._deferredHlsStartPosition = null;
   }
 
   private consumeHlsStartPosition(): number {
@@ -1081,6 +1128,28 @@ export class PlaysVideoEngine extends EventTarget {
     return capabilities;
   }
 
+  private async populateAv1Metadata(media: PlaybackMediaMetadata, source?: File | Blob | ArrayBuffer): Promise<void> {
+    // Detect AV1 support once and cache
+    if (!this._av1Support) {
+      this._av1Support = await detectAv1Support();
+    }
+
+    // Check if video codec is AV1
+    const isAv1 = media.sourceVideoCodec === 'av1' || 
+                  media.videoCodec?.startsWith('av01');
+    media.isAv1Video = isAv1;
+
+    // Validate AV1 metadata if applicable
+    if (isAv1 && source) {
+      try {
+        media.av1MetadataValid = await validateAv1Metadata(source);
+      } catch (error) {
+        console.warn('[AV1] Metadata validation error:', error);
+        media.av1MetadataValid = null;
+      }
+    }
+  }
+
   private evaluateInitialPlayback(media: PlaybackMediaMetadata): PlaybackEvaluationResult {
     const options = this._blobUrl
       ? [
@@ -1227,7 +1296,7 @@ export class PlaysVideoEngine extends EventTarget {
     }
   }
 
-  private handleWorkerMessage(event: MessageEvent): void {
+  private async handleWorkerMessage(event: MessageEvent): Promise<void> {
     const msg = event.data;
 
     if (msg.type === 'probed') {
@@ -1240,6 +1309,7 @@ export class PlaysVideoEngine extends EventTarget {
         hasAudioDecoderConfig: msg.hasAudioDecoderConfig !== false,
         hasAudioTrack: msg.hasAudioTrack === true,
       };
+      await this.populateAv1Metadata(media);
       const evaluation = this.evaluateInitialPlayback(media);
       this.logPlaybackDiagnostics('playback selection', evaluation);
       this.dispatchPlaybackDecision(media, evaluation);
@@ -1487,6 +1557,7 @@ export class PlaysVideoEngine extends EventTarget {
         hasAudioDecoderConfig: demux.audioTrack ? demux.audioDecoderConfig !== null : true,
         hasAudioTrack: demux.audioTrack !== null,
       };
+      await this.populateAv1Metadata(media);
       const evaluation = this.evaluateSourcePlayback(media);
       this.logPlaybackDiagnostics('source playback selection', evaluation);
       this.dispatchPlaybackDecision(media, evaluation);
@@ -1740,6 +1811,13 @@ export class PlaysVideoEngine extends EventTarget {
 
     // Need to capture `this` for the loader classes
     const engine = this;
+    const completeStats = (stats: LoaderStats, byteLength: number): void => {
+      const now = performance.now();
+      stats.loaded = byteLength;
+      stats.total = byteLength;
+      stats.loading.first = now;
+      stats.loading.end = now;
+    };
 
     class PipelinePlaylistLoader implements Loader<PlaylistLoaderContext> {
       context: PlaylistLoaderContext | null = null;
@@ -1751,22 +1829,27 @@ export class PlaysVideoEngine extends EventTarget {
         callbacks: LoaderCallbacks<PlaylistLoaderContext>,
       ) {
         this.context = context;
+        this.stats = makeStats();
+        mlog(`hls loader playlist start url=${context.url}`);
 
         if (engine.playlist) {
           const data = engine.playlist;
           queueMicrotask(() => {
-            this.stats.loaded = data.length;
-            this.stats.loading.end = performance.now();
-            callbacks.onSuccess({ url: context.url, data }, this.stats, context, null);
+            completeStats(this.stats, data.length);
+            mlog(`hls loader playlist success bytes=${data.length}`);
+            callbacks.onProgress?.(this.stats, context, data, null);
+            callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
           });
         } else {
           engine.pendingPlaylist = {
             resolve: (data) => {
-              this.stats.loaded = data.length;
-              this.stats.loading.end = performance.now();
-              callbacks.onSuccess({ url: context.url, data }, this.stats, context, null);
+              completeStats(this.stats, data.length);
+              mlog(`hls loader playlist success bytes=${data.length}`);
+              callbacks.onProgress?.(this.stats, context, data, null);
+              callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
             },
             reject: (err) => {
+              mlog(`hls loader playlist error ${normalizeErrorMessage(err.message)}`);
               callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
             },
           };
@@ -1791,6 +1874,7 @@ export class PlaysVideoEngine extends EventTarget {
       ) {
         this.context = context;
         this.callbacks = callbacks;
+        this.stats = makeStats();
         this.aborted = false;
         const url = context.url;
 
@@ -1810,21 +1894,25 @@ export class PlaysVideoEngine extends EventTarget {
         context: FragmentLoaderContext,
         callbacks: LoaderCallbacks<FragmentLoaderContext>,
       ) {
+        mlog('hls loader init start');
         if (engine.initData) {
           const data = engine.initData;
           queueMicrotask(() => {
-            this.stats.loaded = data.byteLength;
-            this.stats.loading.end = performance.now();
-            callbacks.onSuccess({ url: context.url, data }, this.stats, context, null);
+            completeStats(this.stats, data.byteLength);
+            mlog(`hls loader init success bytes=${data.byteLength}`);
+            callbacks.onProgress?.(this.stats, context, data, null);
+            callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
           });
         } else {
           engine.pendingInit = {
             resolve: (data) => {
-              this.stats.loaded = data.byteLength;
-              this.stats.loading.end = performance.now();
-              callbacks.onSuccess({ url: context.url, data }, this.stats, context, null);
+              completeStats(this.stats, data.byteLength);
+              mlog(`hls loader init success bytes=${data.byteLength}`);
+              callbacks.onProgress?.(this.stats, context, data, null);
+              callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
             },
             reject: (err) => {
+              mlog(`hls loader init error ${normalizeErrorMessage(err.message)}`);
               callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
             },
           };
@@ -1837,6 +1925,7 @@ export class PlaysVideoEngine extends EventTarget {
         callbacks: LoaderCallbacks<FragmentLoaderContext>,
       ) {
         this.currentSegmentIndex = index;
+        mlog(`hls loader seg ${index} start`);
         const segmentPromise = engine._source
           ? engine.requestSourceSegment(index)
           : engine.requestSegment(index);
@@ -1846,9 +1935,10 @@ export class PlaysVideoEngine extends EventTarget {
               return;
             }
             this.currentSegmentIndex = null;
-            this.stats.loaded = data.byteLength;
-            this.stats.loading.end = performance.now();
-            callbacks.onSuccess({ url: context.url, data }, this.stats, context, null);
+            completeStats(this.stats, data.byteLength);
+            mlog(`hls loader seg ${index} success bytes=${data.byteLength}`);
+            callbacks.onProgress?.(this.stats, context, data, null);
+            callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
           })
           .catch((err) => {
             if (this.aborted) {
@@ -1857,9 +1947,11 @@ export class PlaysVideoEngine extends EventTarget {
             this.currentSegmentIndex = null;
             if (err instanceof DOMException && err.name === 'AbortError') {
               this.stats.aborted = true;
+              mlog(`hls loader seg ${index} abort`);
               callbacks.onAbort?.(this.stats, context, null);
               return;
             }
+            mlog(`hls loader seg ${index} error ${normalizeErrorMessage(err.message)}`);
             callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
           });
       }
@@ -1884,6 +1976,7 @@ export class PlaysVideoEngine extends EventTarget {
           this.currentSegmentIndex = null;
         }
         if (abortedActiveSegment && this.callbacks && this.context) {
+          mlog('hls loader abort active segment');
           this.callbacks.onAbort?.(this.stats, this.context, null);
         }
       }
@@ -1922,8 +2015,25 @@ export class PlaysVideoEngine extends EventTarget {
     });
 
 
+    this.video.addEventListener('pause', this._onVideoPause);
+    this.video.addEventListener('play', this._onVideoPlay);
+    this.video.addEventListener('seeked', this._onVideoSeeked);
+    this.video.addEventListener('error', () => {
+      mlog(
+        `video.error ${describeMediaError(this.video.error)} snapshot=${this.debugPlaybackSnapshot()}`,
+      );
+    });
+
+    this.hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      this._hlsMediaAttached = true;
+      mlog('hls MEDIA_ATTACHED');
+      this.tryStartHlsLoad('hls MEDIA_ATTACHED');
+    });
+
     this.hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+      this._hlsManifestParsed = true;
       mlog(`hls MANIFEST_PARSED levels=${data.levels.length}`);
+      this.tryStartHlsLoad('hls MANIFEST_PARSED');
       if (this.video.autoplay) {
         this.video.play().catch(() => {});
       }
@@ -1931,6 +2041,12 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.hls.on(Hls.Events.FRAG_LOADING, (_evt, data) => {
       mlog(`hls FRAG_LOADING sn=${data.frag.sn} url=${data.frag.relurl}`);
+    });
+
+    this.hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
+      mlog(
+        `hls FRAG_LOADED sn=${data.frag.sn} bytes=${data.payload.byteLength}`,
+      );
     });
 
     this.hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
@@ -2001,17 +2117,24 @@ export class PlaysVideoEngine extends EventTarget {
       }
     });
 
-    this.hls.loadSource('/virtual/playlist.m3u8');
     this.hls.attachMedia(this.video);
+    this.hls.loadSource('/virtual/playlist.m3u8');
 
-    this.video.addEventListener('pause', this._onVideoPause);
-    this.video.addEventListener('play', this._onVideoPlay);
-    this.video.addEventListener('seeked', this._onVideoSeeked);
-    this.video.addEventListener('error', () => {
-      mlog(
-        `video.error ${describeMediaError(this.video.error)} snapshot=${this.debugPlaybackSnapshot()}`,
-      );
-    });
+    // Safari-critical: listen for sourceopen to gate HLS startup
+    const onSourceOpen = () => {
+      this._hlsSourceOpenFired = true;
+      mlog('MediaSource sourceopen fired');
+      this.tryStartHlsLoad('MediaSource sourceopen');
+      // Remove listener after first fire
+      const ms = (this.hls?.media as any)?.mediaSource;
+      if (ms) {
+        ms.removeEventListener('sourceopen', onSourceOpen);
+      }
+    };
+    const ms = (this.hls?.media as any)?.mediaSource;
+    if (ms) {
+      ms.addEventListener('sourceopen', onSourceOpen);
+    }
 
     for (const evt of ['waiting', 'playing', 'emptied', 'abort'] as const) {
       this.video.addEventListener(evt, () => {
