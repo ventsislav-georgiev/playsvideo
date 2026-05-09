@@ -1990,25 +1990,31 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.video.disableRemotePlayback = true;
 
+    // Playback gate: defer autoplay until minimum segments are buffered
+    let segmentsBuffered = 0;
+    const PLAYBACK_GATE_SEGMENTS = 2;  // Wait for 2 segments before auto-play
+
     this.hls = new Hls({
       pLoader: PipelinePlaylistLoader as any,
       fLoader: PipelineFragmentLoader as any,
       enableWorker: false,
       autoStartLoad: false,
       preferManagedMediaSource: false,
-      // VOD buffering tuning for slow-generated segments:
-      // Increased from 15s to 60s to tolerate segment generation latency.
-      maxBufferLength: 60,
-      // Increased from 30s to 300s to allow aggressive prefetch without stalling playback.
-      maxMaxBufferLength: 300,
+      // VOD buffering tuning for slow-generated segments (MODERATE profile):
+      // Reduced from 60s to 10s for faster startup with moderate segment generation speed
+      maxBufferLength: 10,
+      // Reduced from 300s to 45s to reduce memory waste while maintaining prefetch buffer
+      maxMaxBufferLength: 45,
       // Cap total buffered data at 100MB to prevent memory bloat on long VODs.
       maxBufferSize: 100 * 1000 * 1000,
+      // Reduced from 30s to 10s to free memory faster during playback
+      backBufferLength: 10,
+      // Reduced from 0.5s to 0.25s to catch buffer holes earlier
+      maxBufferHole: 0.25,
       // Increased from default 8s to allow slower segment delivery without triggering stall recovery.
       maxLoadingDelay: 8,
       // Enable progressive loading to start playback sooner without waiting for full buffer.
       progressive: true,
-      backBufferLength: 30,
-      maxBufferHole: 0.5,
       nudgeOffset: 0.1,
       nudgeMaxRetry: 6,
       highBufferWatchdogPeriod: 1,
@@ -2034,9 +2040,7 @@ export class PlaysVideoEngine extends EventTarget {
       this._hlsManifestParsed = true;
       mlog(`hls MANIFEST_PARSED levels=${data.levels.length}`);
       this.tryStartHlsLoad('hls MANIFEST_PARSED');
-      if (this.video.autoplay) {
-        this.video.play().catch(() => {});
-      }
+      // NOTE: Autoplay is deferred until playback gate (FRAG_BUFFERED) to ensure segments are ready
     });
 
     this.hls.on(Hls.Events.FRAG_LOADING, (_evt, data) => {
@@ -2050,6 +2054,17 @@ export class PlaysVideoEngine extends EventTarget {
     });
 
     this.hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
+      // Playback gate: trigger autoplay once minimum segments are buffered
+      segmentsBuffered++;
+      if (
+        segmentsBuffered >= PLAYBACK_GATE_SEGMENTS &&
+        this.video.paused &&
+        this.video.autoplay
+      ) {
+        mlog(`hls playback-gate triggered (${segmentsBuffered} segments buffered)`);
+        this.video.play().catch(() => {});
+      }
+
       const sb = this.video.buffered;
       const ranges: string[] = [];
       const gaps: BufferedGap[] = [];
@@ -2104,6 +2119,17 @@ export class PlaysVideoEngine extends EventTarget {
       mlog(
         `hls ERROR fatal=${data.fatal} type=${data.type} details=${data.details} sn=${fragSn ?? 'none'}${underlyingMessage ? ` message=${underlyingMessage}` : ''} mediaError=${describeMediaError(this.video.error)} snapshot=${this.debugPlaybackSnapshot(fragSn)}`,
       );
+
+      // Monitor buffer stalls and adaptively increase buffer target if needed
+      if (data.details === 'bufferStalledError' && this.hls) {
+        const currentMax = this.hls.config.maxBufferLength;
+        const newMax = Math.min(currentMax + 5, this.hls.config.maxMaxBufferLength);
+        if (newMax > currentMax) {
+          mlog(`hls STALL_RECOVERY increasing maxBufferLength ${currentMax}s → ${newMax}s`);
+          this.hls.config.maxBufferLength = newMax;
+        }
+      }
+
       if (data.fatal) {
         console.error('hls.js fatal error:', data);
         const internalMessage = this.getRecentInternalError();
