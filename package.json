@@ -61,6 +61,7 @@
     "dexie": "^4.0.0",
     "dexie-react-hooks": "^1.1.0",
     "firebase-tools": "^15.11.0",
+    "jsdom": "^29.1.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.0.0",

@@ -137,6 +137,9 @@ export function Player() {
     diagnosticsStatus,
     av1WarningMessage,
     savePosition,
+    seekSubtitle,
+    subtitleSeekingCapability,
+    subtitleSeekingStatus,
   } =
     useEngine(
       resolvedEntry &&

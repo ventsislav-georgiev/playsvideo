@@ -184,15 +184,8 @@ export async function extractSubtitleDataStreaming(
     flushBatch(true);
   }
 
-  let header: string | undefined;
-  if ((codec === 'ass' || codec === 'ssa') && !options.signal?.aborted) {
-    reportProgress('exporting-text', totalRead);
-    const exported = await track.exportToText();
-    header = extractAssHeader(exported);
-  }
-
   reportProgress('done', totalRead);
-  return { codec, header };
+  return { codec };
 }
 
 /**

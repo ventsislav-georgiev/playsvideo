@@ -44,6 +44,7 @@ import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import { isAbortableSource } from './pipeline/source-signal.js';
 import type {
   FfmpegRunner,
+  AudioTrackInfo as EmbeddedAudioTrackInfo,
   KeyframeIndex,
   PlannedSegment,
   SubtitleTrackInfo,
@@ -54,12 +55,15 @@ import type {
   WorkerSegmentStateMessage,
   WorkerSubtitleProgressMessage,
 } from './worker-protocol.js';
+import { AudioTrackManager, type AudioTrackSelectionEvent } from './audio-track-manager.js';
 
 export type EnginePhase = 'idle' | 'demuxing' | 'ready' | 'error';
 
 export interface ReadyDetail {
   totalSegments: number;
   durationSec: number;
+  audioTracks: EmbeddedAudioTrackInfo[];
+  selectedAudioTrackIndex: number | null;
   subtitleTracks: SubtitleTrackInfo[];
   passthrough?: boolean;
   codecPath: CodecPath;
@@ -272,6 +276,8 @@ export class PlaysVideoEngine extends EventTarget {
   private _lastBufferedGapsBySegment = new Map<number, BufferedGap[]>();
   private _recentSegmentDeliveries: SegmentDeliveryDebug[] = [];
   private hls: Hls | null = null;
+  private audioTrackManager: AudioTrackManager | null = null;
+  private _contentId: string | null = null;
 
   // Pending segment requests from hls.js custom loader
   private pendingSegments = new Map<
@@ -297,6 +303,8 @@ export class PlaysVideoEngine extends EventTarget {
   // Subtitle state
   private attachedSubtitleTracks: AttachedSubtitleTrack[] = [];
   private _subtitleTracks: SubtitleTrackInfo[] = [];
+  private _audioTracks: EmbeddedAudioTrackInfo[] = [];
+  private _selectedAudioTrackIndex: number | null = null;
   private subtitleWindowEnd = new Map<number, number>();
   private subtitleWindowLoading = new Set<number>();
   private subtitleRequestedWindowEnd = new Map<number, number>();
@@ -560,6 +568,7 @@ export class PlaysVideoEngine extends EventTarget {
 
   loadFile(file: File, opts?: { keyframeIndex?: KeyframeIndex } & LoadStartOptions): void {
     this.reset({ file });
+    this._contentId = `file_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
     this._pendingFileType = file.type || null;
     this._blobUrl = URL.createObjectURL(file);
     this._keyframeIndex = opts?.keyframeIndex ?? null;
@@ -585,6 +594,7 @@ export class PlaysVideoEngine extends EventTarget {
 
   loadUrl(url: string, opts?: { keyframeIndex?: KeyframeIndex } & LoadStartOptions): void {
     this.reset({ url });
+    this._contentId = `url_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
     this._keyframeIndex = opts?.keyframeIndex ?? null;
     this.setInitialStartTime(opts?.startTimeSec);
     const directMimeType = inferDirectUrlMimeType(url);
@@ -719,11 +729,18 @@ export class PlaysVideoEngine extends EventTarget {
     this._selectOnExtract.clear();
     this._subtitleOffsetSec = 0;
     this.removeSubtitleTracks();
+    if (this.audioTrackManager) {
+      this.audioTrackManager.destroy();
+      this.audioTrackManager = null;
+    }
+    this._contentId = null;
 
     this._phase = 'demuxing';
     this._totalSegments = 0;
     this._durationSec = 0;
     this._subtitleTracks = [];
+    this._audioTracks = [];
+    this._selectedAudioTrackIndex = null;
     this._passthrough = false;
     this._pendingFileType = null;
     this._keyframeIndex = null;
@@ -886,6 +903,60 @@ export class PlaysVideoEngine extends EventTarget {
     }
   }
 
+  /**
+   * Get the audio track manager for the currently loaded content.
+   * Returns null if no content is loaded or audio track management is unavailable.
+   */
+  getAudioTrackManager(): AudioTrackManager | null {
+    return this.audioTrackManager;
+  }
+
+  get audioTracks(): EmbeddedAudioTrackInfo[] {
+    return this._audioTracks;
+  }
+
+  get selectedAudioTrackIndex(): number | null {
+    return this._selectedAudioTrackIndex;
+  }
+
+  selectAudioTrack(trackIndex: number): boolean {
+    const track = this._audioTracks.find((audioTrack) => audioTrack.index === trackIndex);
+    if (!track) return false;
+
+    const managedTrack = this.audioTrackManager
+      ?.getTracks()
+      .find((audioTrack) => audioTrack.index === trackIndex);
+    if (this.audioTrackManager && managedTrack) {
+      this.audioTrackManager.selectTrack(trackIndex);
+      this._selectedAudioTrackIndex = trackIndex;
+      return true;
+    }
+
+    if (!this.worker || this._passthrough) return false;
+    this.pendingSegments.clear();
+    this.segmentRequestTimes.clear();
+    this._segmentStates.clear();
+    this.playlist = null;
+    this.initData = null;
+    this.pendingPlaylist = null;
+    this.pendingInit = null;
+    if (this.hls) {
+      this.hls.destroy();
+      this.hls = null;
+    }
+    if (this.audioTrackManager) {
+      this.audioTrackManager.destroy();
+      this.audioTrackManager = null;
+    }
+    this._selectedAudioTrackIndex = trackIndex;
+    this.worker.postMessage({
+      type: 'select-audio',
+      index: trackIndex,
+      initialStartTimeSec: this.video.currentTime || this._initialStartTimeSec || 0,
+    });
+    return true;
+  }
+
   destroy(): void {
     this.video.removeEventListener('pause', this._onVideoPause);
     this.video.removeEventListener('play', this._onVideoPlay);
@@ -909,6 +980,11 @@ export class PlaysVideoEngine extends EventTarget {
       this.video.load();
     }
     this.removeSubtitleTracks();
+    if (this.audioTrackManager) {
+      this.audioTrackManager.destroy();
+      this.audioTrackManager = null;
+    }
+    this._contentId = null;
     if (this._sourceSegmentAbort) {
       this._sourceSegmentAbort.abort();
       this._sourceSegmentAbort = null;
@@ -1377,6 +1453,8 @@ export class PlaysVideoEngine extends EventTarget {
           detail: {
             totalSegments: 0,
             durationSec: this._durationSec,
+            audioTracks: this._audioTracks,
+            selectedAudioTrackIndex: this._selectedAudioTrackIndex,
             subtitleTracks: this._subtitleTracks,
             passthrough: true,
             codecPath: this.codecPath,
@@ -1415,6 +1493,8 @@ export class PlaysVideoEngine extends EventTarget {
       this.logPlaybackDiagnostics('playback selection', evaluation);
       this.dispatchPlaybackDecision(media, evaluation);
       this._subtitleTracks = msg.subtitleTracks ?? [];
+      this._audioTracks = msg.audioTracks ?? [];
+      this._selectedAudioTrackIndex = msg.selectedAudioTrackIndex ?? null;
       const blobUrl = this._blobUrl;
       const selectedOption = evaluation.recommended?.option ?? null;
       const directPassthroughUrl =
@@ -1462,6 +1542,8 @@ export class PlaysVideoEngine extends EventTarget {
       this._totalSegments = msg.totalSegments;
       this._durationSec = msg.durationSec;
       this._subtitleTracks = msg.subtitleTracks ?? [];
+      this._audioTracks = msg.audioTracks ?? [];
+      this._selectedAudioTrackIndex = msg.selectedAudioTrackIndex ?? null;
       this._phase = 'ready';
       this._codecPath = {
         mode: 'pipeline',
@@ -1507,6 +1589,8 @@ export class PlaysVideoEngine extends EventTarget {
           detail: {
             totalSegments: this._totalSegments,
             durationSec: this._durationSec,
+            audioTracks: this._audioTracks,
+            selectedAudioTrackIndex: this._selectedAudioTrackIndex,
             subtitleTracks: this._subtitleTracks,
             codecPath: this.codecPath,
           },
@@ -1679,6 +1763,8 @@ export class PlaysVideoEngine extends EventTarget {
           );
         }
         this._subtitleTracks = demux.subtitleTracks;
+        this._audioTracks = demux.audioTracks;
+        this._selectedAudioTrackIndex = demux.audioTrackIndex;
         this._codecPath = this.makeCodecPathFromSource(media, 'passthrough');
         this._sourcePlan = [];
         this._sourceDoTranscode = false;
@@ -1752,6 +1838,8 @@ export class PlaysVideoEngine extends EventTarget {
       this._totalSegments = this._sourcePlan.length;
       this._durationSec = demux.duration;
       this._subtitleTracks = demux.subtitleTracks;
+      this._audioTracks = demux.audioTracks;
+      this._selectedAudioTrackIndex = demux.audioTrackIndex;
       this._phase = 'ready';
 
       mlog(
@@ -1763,6 +1851,8 @@ export class PlaysVideoEngine extends EventTarget {
           detail: {
             totalSegments: this._totalSegments,
             durationSec: this._durationSec,
+            audioTracks: this._audioTracks,
+            selectedAudioTrackIndex: this._selectedAudioTrackIndex,
             subtitleTracks: this._subtitleTracks,
             codecPath: this.codecPath,
           },
@@ -2245,6 +2335,28 @@ export class PlaysVideoEngine extends EventTarget {
     });
 
     this.hls.attachMedia(this.video);
+
+    // Initialize audio track manager
+    if (this.hls && this._contentId) {
+      if (this.audioTrackManager) this.audioTrackManager.destroy();
+      this.audioTrackManager = new AudioTrackManager({
+        storageKeyPrefix: 'bookplay_audio_track',
+        debug: false,
+      });
+      this.audioTrackManager.initialize(this.hls, this.video, this._contentId);
+      
+      // Wire up audio track selection events to engine event system
+      this.audioTrackManager.on((evt: AudioTrackSelectionEvent) => {
+        if (evt.type === 'tracks-available') {
+          mlog(`audio tracks available: ${evt.tracks?.length ?? 0} tracks`);
+        } else if (evt.type === 'track-switched') {
+          mlog(`audio track switched: ${evt.selectedTrack?.label ?? 'unknown'}`);
+          this._selectedAudioTrackIndex = evt.selectedIndex ?? this._selectedAudioTrackIndex;
+        } else if (evt.type === 'track-error') {
+          mlog(`audio track error: ${evt.error ?? 'unknown'}`);
+        }
+      });
+    }
     this.hls.loadSource('/virtual/playlist.m3u8');
 
     // Safari-critical: listen for sourceopen to gate HLS startup
@@ -2401,7 +2513,7 @@ export class PlaysVideoEngine extends EventTarget {
         for (let i = 0; i < this.video.textTracks.length; i++) {
           this.video.textTracks[i].mode = 'disabled';
         }
-        textTrack.mode = 'hidden';
+        textTrack.mode = 'showing';
       } else {
         textTrack.mode = 'hidden';
       }

@@ -13,7 +13,7 @@ import {
 import { Source } from '../source.js';
 import { type AbortableSource, checkAbort } from './source-signal.js';
 import { getSubtitleTrackInfos } from './subtitle.js';
-import type { KeyframeEntry, KeyframeIndex, PlannedSegment, SubtitleTrackInfo } from './types.js';
+import type { AudioTrackInfo, KeyframeEntry, KeyframeIndex, PlannedSegment, SubtitleTrackInfo } from './types.js';
 
 const KEYFRAME_LOOKUP_EARLY_SEC = 0.5;
 const KEYFRAME_LOOKUP_LATE_SEC = 0.2;
@@ -37,6 +37,8 @@ export interface DemuxResult {
   duration: number;
   videoTrack: InputVideoTrack;
   audioTrack: InputAudioTrack | null;
+  audioTrackIndex: number | null;
+  audioTracks: AudioTrackInfo[];
   videoCodec: string;
   audioCodec: string | null;
   audioInternalCodecId: string | null;
@@ -48,14 +50,14 @@ export interface DemuxResult {
   dispose: () => void;
 }
 
-export async function demuxFile(filePath: string): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new FilePathSource(filePath) }));
+export async function demuxFile(filePath: string, selectedAudioTrackIndex?: number): Promise<DemuxResult> {
+  return demuxInput(new Input({ formats: ALL_FORMATS, source: new FilePathSource(filePath) }), selectedAudioTrackIndex);
 }
 
-export async function demuxBlob(blob: Blob): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) }));
+export async function demuxBlob(blob: Blob, selectedAudioTrackIndex?: number): Promise<DemuxResult> {
+  return demuxInput(new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) }), selectedAudioTrackIndex);
 }
-export async function demuxUrl(url: string): Promise<DemuxResult> {
+export async function demuxUrl(url: string, selectedAudioTrackIndex?: number): Promise<DemuxResult> {
   const source = new UrlSource(url, {
     maxCacheSize: 64 * 2 ** 20, // 64 MiB (default)
     parallelism: 2, // 2 concurrent requests (default)
@@ -65,7 +67,7 @@ export async function demuxUrl(url: string): Promise<DemuxResult> {
       return 100 * 2 ** attempts;
     },
   });
-  return demuxInput(new Input({ formats: ALL_FORMATS, source }));
+  return demuxInput(new Input({ formats: ALL_FORMATS, source }), selectedAudioTrackIndex);
 }
 
 export class AbortableUrlSource extends Source implements AbortableSource {
@@ -368,8 +370,28 @@ class SourceAdapter extends MBSource {
   }
 }
 
-export async function demuxSource(source: Source): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new SourceAdapter(source) }));
+export async function demuxSource(source: Source, selectedAudioTrackIndex?: number): Promise<DemuxResult> {
+  return demuxInput(new Input({ formats: ALL_FORMATS, source: new SourceAdapter(source) }), selectedAudioTrackIndex);
+}
+
+export async function getAudioTrackInfos(input: Input): Promise<AudioTrackInfo[]> {
+  const tracks = await input.getAudioTracks();
+  return tracks.map((track, i) => {
+    const disposition = track.disposition;
+    return {
+      index: i,
+      codec: track.codec ?? null,
+      language: track.languageCode,
+      name: track.name,
+      channels: Number.isFinite(track.numberOfChannels) ? track.numberOfChannels : null,
+      sampleRate: Number.isFinite(track.sampleRate) ? track.sampleRate : null,
+      disposition: {
+        default: disposition.default,
+        forced: disposition.forced,
+        hearingImpaired: disposition.hearingImpaired,
+      },
+    };
+  });
 }
 
 /**
@@ -400,7 +422,7 @@ export async function createSubtitleInput(blob: Blob | null, url: string | null)
   return input;
 }
 
-async function demuxInput(input: Input): Promise<DemuxResult> {
+async function demuxInput(input: Input, selectedAudioTrackIndex?: number): Promise<DemuxResult> {
   const tTotal = performance.now();
   demuxLog('phase start');
 
@@ -412,11 +434,20 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   }
 
   let audioTrack: InputAudioTrack | null = null;
+  let audioTrackIndex: number | null = null;
+  let audioTracks: InputAudioTrack[] = [];
   try {
-    audioTrack = await timedDemuxPhase('getPrimaryAudioTrack', () => input.getPrimaryAudioTrack());
+    audioTracks = await timedDemuxPhase('getAudioTracks', () => input.getAudioTracks());
+    if (audioTracks.length > 0) {
+      const requestedIndex = Number.isInteger(selectedAudioTrackIndex) ? selectedAudioTrackIndex! : null;
+      audioTrackIndex = requestedIndex !== null && requestedIndex >= 0 && requestedIndex < audioTracks.length
+        ? requestedIndex
+        : Math.max(0, audioTracks.findIndex((track) => track.disposition.default));
+      audioTrack = audioTracks[audioTrackIndex] ?? null;
+    }
   } catch {
     // No audio track — that's fine
-    demuxLog('phase getPrimaryAudioTrack failed/no-audio');
+    demuxLog('phase getAudioTracks failed/no-audio');
   }
 
   const videoCodec = videoTrack.codec;
@@ -451,6 +482,7 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
   const subtitleTracks = await timedDemuxPhase('getSubtitleTrackInfos', () =>
     getSubtitleTrackInfos(input),
   );
+  const audioTrackInfos = await timedDemuxPhase('getAudioTrackInfos', () => getAudioTrackInfos(input));
   demuxLog(`phase complete total=${elapsed(tTotal)}`);
 
   return {
@@ -458,6 +490,8 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
     duration,
     videoTrack,
     audioTrack,
+    audioTrackIndex,
+    audioTracks: audioTrackInfos,
     videoCodec,
     audioCodec: audioTrack?.codec ?? mapAudioInternalCodecId(audioInternalCodecId),
     audioInternalCodecId,

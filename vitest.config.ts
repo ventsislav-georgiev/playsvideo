@@ -7,5 +7,6 @@ export default defineConfig({
     testTimeout: 120_000,
     pool: 'forks',
     globals: true,
+    environment: "jsdom",
   },
 });

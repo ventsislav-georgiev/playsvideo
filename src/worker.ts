@@ -17,6 +17,7 @@ import {
   createVideoBoundaryResolver,
   demuxBlob,
   demuxSource,
+  demuxUrl,
   getKeyframeIndex,
 } from './pipeline/demux.js';
 import {
@@ -358,6 +359,7 @@ let initSegment: Uint8Array | null = null;
 let currentBlob: Blob | null = null;
 let currentUrl: string | null = null;
 let currentSource: AbortableUrlSource | null = null;
+let selectedAudioTrackIndex: number | null = null;
 const SEGMENT_TIMEOUT_MS = 120_000;
 const segmentCache = new Map<number, Uint8Array>();
 const segmentTasks = new Map<number, Promise<Uint8Array>>();
@@ -470,7 +472,8 @@ self.onmessage = (event: MessageEvent) => {
     currentBlob = msg.file;
     currentUrl = null;
     currentSource = null;
-    queuePipelineSetup(() => handleProbe(() => demuxBlob(msg.file)));
+    selectedAudioTrackIndex = null;
+    queuePipelineSetup(() => handleProbe(() => demuxBlob(msg.file, selectedAudioTrackIndex ?? undefined)));
   } else if (msg.type === 'open-url') {
     wlog('recv open-url');
     paused = false;
@@ -480,10 +483,14 @@ self.onmessage = (event: MessageEvent) => {
     currentBlob = null;
     currentUrl = msg.url;
     currentSource = new AbortableUrlSource(msg.url);
-    queuePipelineSetup(() => handleProbe(() => demuxSource(currentSource!)));
+    selectedAudioTrackIndex = null;
+    queuePipelineSetup(() => handleProbe(() => demuxSource(currentSource!, selectedAudioTrackIndex ?? undefined)));
   } else if (msg.type === 'remux-pipeline') {
     wlog('recv remux-pipeline');
     queuePipelineSetup(() => handleRemuxPipeline(msg.keyframeIndex, msg.initialStartTimeSec));
+  } else if (msg.type === 'select-audio') {
+    wlog(`recv select-audio index=${msg.index}`);
+    queuePipelineSetup(() => handleAudioTrackSelection(msg.index, msg.initialStartTimeSec));
   } else if (msg.type === 'passthrough-pipeline') {
     wlog('recv passthrough-pipeline — subtitle-only mode');
   } else if (msg.type === 'transcode-port') {
@@ -793,6 +800,8 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
     sourceAudioCodec: demux.audioCodec,
     audioInternalCodecId: demux.audioInternalCodecId,
     hasAudioTrack: demux.audioTrack !== null,
+    selectedAudioTrackIndex: demux.audioTrackIndex,
+    audioTracks: demux.audioTracks,
     videoCodec: demux.videoDecoderConfig.codec,
     audioCodec: demux.audioDecoderConfig?.codec ?? null,
     hasAudioDecoderConfig: demux.audioTrack ? demux.audioDecoderConfig !== null : true,
@@ -947,6 +956,8 @@ async function handleRemuxPipeline(
           ? 'aac'
           : demux.audioCodec,
       outputAudioCodecFull: audioDecoderConfig?.codec ?? null,
+      selectedAudioTrackIndex: demux.audioTrackIndex,
+      audioTracks: demux.audioTracks,
       subtitleTracks: demux.subtitleTracks,
     },
     { transfer: [] },
@@ -957,6 +968,44 @@ async function handleRemuxPipeline(
   } else {
     schedulePrefetch(initialSegmentIndex !== null && initialSegmentIndex > 0 ? initialSegmentIndex : 1);
   }
+}
+
+async function handleAudioTrackSelection(index: unknown, initialStartTimeSec?: number): Promise<void> {
+  if (!Number.isInteger(index)) return;
+  const nextIndex = index as number;
+  if (nextIndex < 0) return;
+  if (selectedAudioTrackIndex === nextIndex && demux?.audioTrackIndex === nextIndex) return;
+
+  prefetchAbort?.abort();
+  prefetchAbort = null;
+  for (const controller of segmentAbortControllers.values()) controller.abort();
+  segmentAbortControllers.clear();
+  segmentTasks.clear();
+  prefetchTaskIndexes.clear();
+  segmentCache.clear();
+  initSegment = null;
+  plan = [];
+  resolveSegmentBoundary = null;
+  selectedAudioTrackIndex = nextIndex;
+
+  if (demux) {
+    demux.dispose();
+    demux = null;
+  }
+  disposeSubtitleInput();
+
+  const t0 = performance.now();
+  if (currentBlob) {
+    demux = await demuxBlob(currentBlob, selectedAudioTrackIndex);
+  } else if (currentSource) {
+    demux = await demuxSource(currentSource, selectedAudioTrackIndex);
+  } else if (currentUrl) {
+    demux = await demuxUrl(currentUrl, selectedAudioTrackIndex);
+  } else {
+    throw new Error('No source available for audio track selection');
+  }
+  wlog(`audio-track re-demux done index=${selectedAudioTrackIndex} ${elapsed(t0)}`);
+  await handleRemuxPipeline(undefined, initialStartTimeSec);
 }
 
 function findSegmentIndexForTime(timeSec: unknown): number | null {
@@ -998,7 +1047,7 @@ async function handleFileRefresh(file: Blob): Promise<void> {
     demux.dispose();
   }
   disposeSubtitleInput();
-  demux = await demuxBlob(file);
+  demux = await demuxBlob(file, selectedAudioTrackIndex ?? undefined);
   segmentCache.clear();
   segmentTasks.clear();
   initSegment = null;

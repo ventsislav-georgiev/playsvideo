@@ -80,6 +80,28 @@ export interface SubtitleTrackInfo {
   };
 }
 
+/** Metadata for a discovered audio track (sent to main thread before selection). */
+export interface AudioTrackInfo {
+  /** Index within the audio tracks array (0-based). */
+  index: number;
+  /** Original codec in the container, if known. */
+  codec: string | null;
+  /** ISO 639-2/T language code (e.g. 'eng', 'spa', 'und'). */
+  language: string;
+  /** User-visible track name, if any. */
+  name: string | null;
+  /** Number of audio channels, if available. */
+  channels: number | null;
+  /** Sample rate in Hz, if available. */
+  sampleRate: number | null;
+  /** Container disposition flags. */
+  disposition: {
+    default: boolean;
+    forced: boolean;
+    hearingImpaired: boolean;
+  };
+}
+
 /**
  * Source of a subtitle track — either embedded in the file or imported by the user.
  * This is the internal representation; the renderer decides what to do with it.
