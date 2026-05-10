@@ -10,6 +10,11 @@ export interface SubtitleTrackMeta {
   index: number;
   label: string;
   language: string;
+  disposition?: {
+    default?: boolean;
+    forced?: boolean;
+    hearingImpaired?: boolean;
+  };
 }
 
 export interface CustomControlsOptions {
@@ -772,15 +777,18 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
 
   // Text track changes — capture extracted tracks and auto-show pending requests
   let pendingSubtitleIndex: number | null = null;
+  const matchesSubtitleMeta = (track: TextTrack, meta: SubtitleTrackMeta) => {
+    if (track.language !== meta.language) return false;
+    if (track.label === meta.label) return true;
+    return pendingSubtitleIndex === meta.index;
+  };
   const onTrackChange = (e: Event) => {
     const trackEvent = e as TrackEvent;
     if (trackEvent.track) {
       for (const meta of subtitleMeta) {
-        const lang = trackEvent.track.language;
-        const label = trackEvent.track.label;
         if (
           !extractedTracks.has(meta.index) &&
-          (lang === meta.language && label === meta.label)
+          matchesSubtitleMeta(trackEvent.track, meta)
         ) {
           extractedTracks.set(meta.index, trackEvent.track);
           if (pendingSubtitleIndex === meta.index) {

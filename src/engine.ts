@@ -238,6 +238,11 @@ interface AttachedSubtitleTrack {
   textTrack?: TextTrack;
 }
 
+type ShiftableTextTrackCue = TextTrackCue & {
+  startTime: number;
+  endTime: number;
+};
+
 function normalizeErrorMessage(message: string): string {
   return message.replace(/^Error:\s*/, '').trim();
 }
@@ -298,6 +303,8 @@ export class PlaysVideoEngine extends EventTarget {
   private _selectOnExtract = new Map<number, boolean>();
   private _subtitleRequestSeq = 0;
   private _activeSubtitleRequestIds = new Map<number, number>();
+  private _subtitleOffsetSec = 0;
+  private _subtitleCueBaseTimes = new WeakMap<TextTrackCue, { startSec: number; endSec: number }>();
 
   // Public read-only state
   private _phase: EnginePhase = 'idle';
@@ -474,6 +481,27 @@ export class PlaysVideoEngine extends EventTarget {
   }
   get subtitleTracks(): SubtitleTrackInfo[] {
     return this._subtitleTracks;
+  }
+
+  get subtitleOffsetSec(): number {
+    return this._subtitleOffsetSec;
+  }
+
+  setSubtitleOffset(seconds: number): number {
+    const nextOffset = Number.isFinite(seconds) ? Math.round(seconds * 10) / 10 : 0;
+    if (Math.abs(nextOffset - this._subtitleOffsetSec) < 0.0001) return this._subtitleOffsetSec;
+
+    this._subtitleOffsetSec = nextOffset;
+    this.applySubtitleOffsetToAttachedCues();
+    return this._subtitleOffsetSec;
+  }
+
+  adjustSubtitleOffset(deltaSeconds: number): number {
+    return this.setSubtitleOffset(this._subtitleOffsetSec + deltaSeconds);
+  }
+
+  resetSubtitleOffset(): number {
+    return this.setSubtitleOffset(0);
   }
 
   requestSubtitleExtraction(trackIndex: number, select = true): boolean {
@@ -689,6 +717,7 @@ export class PlaysVideoEngine extends EventTarget {
     this.subtitleRequestedWindowEnd.clear();
     this._activeSubtitleRequestIds.clear();
     this._selectOnExtract.clear();
+    this._subtitleOffsetSec = 0;
     this.removeSubtitleTracks();
 
     this._phase = 'demuxing';
@@ -2391,7 +2420,9 @@ export class PlaysVideoEngine extends EventTarget {
     for (const cue of msg.cues) {
       try {
         if (this.hasMatchingCue(tt, cue)) continue;
-        const vttCue = new VTTCue(cue.startSec, cue.endSec, cue.text);
+        const adjustedCue = this.applySubtitleOffsetToCue(cue.startSec, cue.endSec);
+        const vttCue = new VTTCue(adjustedCue.startSec, adjustedCue.endSec, cue.text);
+        this._subtitleCueBaseTimes.set(vttCue, { startSec: cue.startSec, endSec: cue.endSec });
         tt.addCue(vttCue);
       } catch (e) {
         console.warn('[playsvideo] VTTCue creation failed:', cue, e);
@@ -2477,6 +2508,9 @@ export class PlaysVideoEngine extends EventTarget {
     track.default = defaultTrack;
     this.video.appendChild(track);
     this.attachedSubtitleTracks.push({ element: track, url, source, trackIndex });
+    if (Math.abs(this._subtitleOffsetSec) >= 0.0001) {
+      track.addEventListener('load', () => this.applySubtitleOffsetToTrack(track.track), { once: true });
+    }
     if (selectTrack) {
       track.addEventListener('load', () => this.showTextTrack(track), { once: true });
       queueMicrotask(() => this.showTextTrack(track));
@@ -2606,6 +2640,45 @@ export class PlaysVideoEngine extends EventTarget {
     }
     const tt = track instanceof HTMLTrackElement ? track.track : track;
     tt.mode = 'showing';
+  }
+
+  private applySubtitleOffsetToAttachedCues(): void {
+    for (const attached of this.attachedSubtitleTracks) {
+      const track = attached.textTrack ?? attached.element.track;
+      this.applySubtitleOffsetToTrack(track);
+    }
+  }
+
+  private applySubtitleOffsetToTrack(track: TextTrack | null | undefined): void {
+    if (!track) return;
+    const cues = Array.from(track.cues ?? []);
+    for (const cue of cues) {
+      if (!this.isShiftableCue(cue)) continue;
+      const baseTimes = this.baseTimesForCue(cue);
+      const duration = Math.max(0.001, baseTimes.endSec - baseTimes.startSec);
+      const startTime = Math.max(0, baseTimes.startSec + this._subtitleOffsetSec);
+      cue.startTime = startTime;
+      cue.endTime = Math.max(startTime + 0.001, startTime + duration);
+    }
+  }
+
+  private applySubtitleOffsetToCue(startSec: number, endSec: number): { startSec: number; endSec: number } {
+    if (Math.abs(this._subtitleOffsetSec) < 0.0001) return { startSec, endSec };
+    const duration = Math.max(0.001, endSec - startSec);
+    const adjustedStart = Math.max(0, startSec + this._subtitleOffsetSec);
+    return { startSec: adjustedStart, endSec: adjustedStart + duration };
+  }
+
+  private isShiftableCue(cue: TextTrackCue): cue is ShiftableTextTrackCue {
+    return 'startTime' in cue && 'endTime' in cue;
+  }
+
+  private baseTimesForCue(cue: ShiftableTextTrackCue): { startSec: number; endSec: number } {
+    const existing = this._subtitleCueBaseTimes.get(cue);
+    if (existing) return existing;
+    const baseTimes = { startSec: cue.startTime, endSec: cue.endTime };
+    this._subtitleCueBaseTimes.set(cue, baseTimes);
+    return baseTimes;
   }
 
   private dispatchSubtitleStatus(message: string): void {

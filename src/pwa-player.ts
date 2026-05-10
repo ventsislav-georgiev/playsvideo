@@ -114,6 +114,7 @@ engine.addEventListener('ready', (e) => {
     index: t.index,
     label: languageLabel(t.language, t.index, t.disposition),
     language: normalizeSubtitleLanguageCode(t.language),
+    disposition: t.disposition,
   }));
   videoReady = true;
   applyControlsType();
