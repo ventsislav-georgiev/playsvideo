@@ -61,6 +61,9 @@ export interface PlaybackCapabilityContext {
 
   /** AV1 support detection result (cached). */
   av1Supported?: 'supported' | 'unsupported' | 'unknown' | null;
+
+  /** Hardware HEVC decode capability via WebCodecs (cached). */
+  hevcHardwareDecode?: 'supported' | 'unsupported' | 'unknown' | null;
 }
 
 export interface BrowserPlaybackCapabilityOptions {
@@ -70,6 +73,9 @@ export interface BrowserPlaybackCapabilityOptions {
 
   /** Pre-detected AV1 support status. */
   av1Supported?: 'supported' | 'unsupported' | 'unknown' | null;
+
+  /** Pre-detected hardware HEVC decode status. */
+  hevcHardwareDecode?: 'supported' | 'unsupported' | 'unknown' | null;
 }
 
 export type PlaybackDiagnosticCode =
@@ -138,6 +144,28 @@ export interface PlaybackEvaluationResult {
 }
 
 const DEFAULT_PREFERENCE_ORDER: PlaybackMode[] = ['direct-url', 'direct-bytes', 'hls'];
+const HEVC_PREFERENCE_ORDER: PlaybackMode[] = ['hls', 'direct-url', 'direct-bytes'];
+
+function isHevcCodec(codec: string | null | undefined): boolean {
+  if (!codec) return false;
+  return /\b(hev1|hvc1|hevc|h\.?265)\b/i.test(codec);
+}
+
+function derivePreferenceOrder(
+  media: PlaybackMediaMetadata,
+  capabilities: PlaybackCapabilityContext,
+): PlaybackMode[] {
+  if (isHevcCodec(media.videoCodec)) {
+    // Direct/native HEVC decode is smooth when the browser has hardware HEVC
+    // support (e.g. macOS/iOS Safari). When hardware decode is unavailable or
+    // unknown, prefer the remux/HLS path so segments at least bypass the
+    // open-GOP keyframe@0 trap; pure software HEVC decode in Chromium may
+    // still drop frames on heavy encodes regardless of the source path.
+    if (capabilities.hevcHardwareDecode === 'supported') return DEFAULT_PREFERENCE_ORDER;
+    return HEVC_PREFERENCE_ORDER;
+  }
+  return DEFAULT_PREFERENCE_ORDER;
+}
 
 /**
  * Convenience helper for browser integrations.
@@ -158,13 +186,15 @@ export function createBrowserPlaybackCapabilities(
     hlsSupported: options.hlsSupported ?? Hls.isSupported(),
     pipelineProbe: options.pipelineProbe ?? createBrowserProber(mediaSource ?? null),
     av1Supported: options.av1Supported ?? null,
+    hevcHardwareDecode: options.hevcHardwareDecode ?? null,
   };
 }
 
 export function evaluatePlaybackOptions(
   input: EvaluatePlaybackOptionsInput,
 ): PlaybackEvaluationResult {
-  const preferenceOrder = input.preferenceOrder ?? DEFAULT_PREFERENCE_ORDER;
+  const preferenceOrder =
+    input.preferenceOrder ?? derivePreferenceOrder(input.media, input.capabilities);
   const evaluations = input.options.map((option) =>
     evaluateOption(option, input.media, input.capabilities),
   );
@@ -175,14 +205,16 @@ export function evaluatePlaybackOptions(
   if (recommendedIndex !== null) {
     const evaluation = evaluations[recommendedIndex];
     evaluation.selected = true;
+    const hevcRouted = evaluation.option.mode === 'hls' && isHevcCodec(input.media.videoCodec);
     recommended = {
       option: evaluation.option,
       reason:
         evaluation.option.mode === 'hls'
           ? {
               code: 'selected-hls',
-              message:
-                'Recommended HLS playback because no higher-preference direct option was supported.',
+              message: hevcRouted
+                ? 'Recommended HLS playback because HEVC sources are routed through remux to avoid native decode flicker.'
+                : 'Recommended HLS playback because no higher-preference direct option was supported.',
             }
           : {
               code: 'selected-direct',

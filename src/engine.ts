@@ -357,6 +357,7 @@ export class PlaysVideoEngine extends EventTarget {
   private _sourcePlaybackOptions: PlaybackOption[] | null = null;
   private _sourcePreferenceOrder: PlaybackMode[] | null = null;
   private _av1Support?: 'supported' | 'unsupported' | 'unknown';
+  private _hevcHardwareDecode?: 'supported' | 'unsupported' | 'unknown';
   private _sourcePlaybackPolicy: PlaybackPolicy = 'auto';
   private _lastInternalErrorMessage: string | null = null;
   private _lastInternalErrorAt = 0;
@@ -963,6 +964,12 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     if (!this.worker || this._passthrough) return false;
+    // Capture the live playback position before tearing down HLS, which would
+    // otherwise reset video.currentTime to 0.
+    const currentMediaTime = Number.isFinite(this.video.currentTime) ? this.video.currentTime : 0;
+    const resumeSec = currentMediaTime > 0
+      ? currentMediaTime
+      : (this._initialStartTimeSec ?? 0);
     this.rejectPendingMediaRequests(new DOMException('Audio track changed', 'AbortError'));
     this.segmentRequestTimes.clear();
     this._segmentStates.clear();
@@ -978,10 +985,13 @@ export class PlaysVideoEngine extends EventTarget {
       this.audioTrackManager = null;
     }
     this._selectedAudioTrackIndex = trackIndex;
+    // Preserve resume position for the new HLS pipeline so playback continues
+    // from the current spot instead of restarting at t=0.
+    this._initialStartTimeSec = resumeSec > 0 ? resumeSec : null;
     this.worker.postMessage({
       type: 'select-audio',
       index: trackIndex,
-      initialStartTimeSec: this.video.currentTime || this._initialStartTimeSec || 0,
+      initialStartTimeSec: resumeSec,
     });
     return true;
   }
@@ -1317,7 +1327,9 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private createPlaybackCapabilities(): ReturnType<typeof createBrowserPlaybackCapabilities> {
-    const capabilities = createBrowserPlaybackCapabilities(this.video);
+    const capabilities = createBrowserPlaybackCapabilities(this.video, {
+      hevcHardwareDecode: this._hevcHardwareDecode ?? null,
+    });
     if (FORCE_REMUX) {
       return {
         ...capabilities,
@@ -1327,14 +1339,52 @@ export class PlaysVideoEngine extends EventTarget {
     return capabilities;
   }
 
+  private async detectHevcHardwareDecode(): Promise<'supported' | 'unsupported' | 'unknown'> {
+    try {
+      if (typeof VideoDecoder === 'undefined' || typeof VideoDecoder.isConfigSupported !== 'function') {
+        return 'unknown';
+      }
+      const probes = [
+        { codec: 'hev1.2.4.L120.90', codedWidth: 1920, codedHeight: 1080 },
+        { codec: 'hvc1.2.4.L120.90', codedWidth: 1920, codedHeight: 1080 },
+        { codec: 'hev1.1.6.L120.90', codedWidth: 1920, codedHeight: 1080 },
+        { codec: 'hvc1.1.6.L120.90', codedWidth: 1920, codedHeight: 1080 },
+      ];
+      for (const probe of probes) {
+        try {
+          const result = await VideoDecoder.isConfigSupported({
+            ...probe,
+            hardwareAcceleration: 'prefer-hardware',
+          });
+          if (result.supported && result.config?.hardwareAcceleration === 'prefer-hardware') {
+            return 'supported';
+          }
+        } catch (_) {
+          /* probe failed, try next */
+        }
+      }
+      return 'unsupported';
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
   private async populateAv1Metadata(media: PlaybackMediaMetadata, source?: File | Blob | ArrayBuffer): Promise<void> {
     // Detect AV1 support once and cache
     if (!this._av1Support) {
       this._av1Support = await detectAv1Support();
     }
 
+    // Probe hardware HEVC decode capability once when source is HEVC.
+    const isHevc = /^(hev1|hvc1)/i.test(media.videoCodec ?? '') ||
+                   /\b(hevc|h265|h\.265)\b/i.test(media.sourceVideoCodec ?? '');
+    if (isHevc && !this._hevcHardwareDecode) {
+      this._hevcHardwareDecode = await this.detectHevcHardwareDecode();
+      mlog(`hevc hardware decode probe → ${this._hevcHardwareDecode}`);
+    }
+
     // Check if video codec is AV1
-    const isAv1 = media.sourceVideoCodec === 'av1' || 
+    const isAv1 = media.sourceVideoCodec === 'av1' ||
                   media.videoCodec?.startsWith('av01');
     media.isAv1Video = isAv1;
 

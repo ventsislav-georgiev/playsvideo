@@ -82,9 +82,20 @@ export async function processSegmentWithAbort(
 
   // Stage 1: Collect video packets
   const tVid = performance.now();
-  const videoPackets = await collectPacketsInRange(config.videoSink, seg.startSec, endSec, {
+  const collectedPackets = await collectPacketsInRange(config.videoSink, seg.startSec, endSec, {
     startFromKeyframe: true,
   });
+  // Some open-GOP MP4 encodes interleave leading non-key packets at the same
+  // timestamp as the keyframe (mediabunny may surface them first). MSE requires
+  // every segment to begin on a key packet, so drop any leading non-keys.
+  let firstKeyIdx = 0;
+  while (firstKeyIdx < collectedPackets.length && collectedPackets[firstKeyIdx].type !== 'key') {
+    firstKeyIdx += 1;
+  }
+  const videoPackets = firstKeyIdx > 0 ? collectedPackets.slice(firstKeyIdx) : collectedPackets;
+  if (firstKeyIdx > 0) {
+    log(`seg ${index} trimmed ${firstKeyIdx} leading non-key video packet(s)`);
+  }
   log(`seg ${index} video-collect ${elapsed(tVid)} pkts=${videoPackets.length}`);
 
   if (videoPackets.length > 0) {

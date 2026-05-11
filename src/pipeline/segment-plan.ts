@@ -59,8 +59,10 @@ export function buildSegmentPlan(options: BuildSegmentPlanOptions): PlannedSegme
   const boundaries = normalizeKeyframeTimestamps(options.keyframeTimestampsSec, durationSec);
   const plan: PlannedSegment[] = [];
   let sequence = sequenceStart;
-  let segmentStartSec = 0;
-  let nextTargetCutSec = targetSegmentDurationSec;
+  // Start at the first real keyframe so seg 0 never begins on a delta packet
+  // (some open-GOP MP4 encodes have their first keyframe at t > 0).
+  let segmentStartSec = boundaries[0] > EPSILON_SEC ? boundaries[0] : 0;
+  let nextTargetCutSec = segmentStartSec + targetSegmentDurationSec;
 
   // Match FFmpeg HLS behavior: cut on the first keyframe at or after each
   // global hls_time boundary (4s, 8s, 12s, ...), not after each segment's

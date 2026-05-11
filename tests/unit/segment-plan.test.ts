@@ -91,17 +91,17 @@ describe('buildSegmentPlan', () => {
     expect(plan[0].uri).toBe('seg-5.m4s');
   });
 
-  it('starts segment 0 at time 0 even when first keyframe is later', () => {
+  it('starts segment 0 at the first real keyframe when it is after t=0', () => {
+    // Open-GOP MP4 encodes can have their first keyframe at t > 0; seg 0
+    // must begin there so MSE never receives a delta packet at segment start.
     const plan = buildSegmentPlan({
       keyframeTimestampsSec: [0.07, 2.5, 5.0],
       durationSec: 5,
       targetSegmentDurationSec: 2,
     });
 
-    // Segment 0 starts at 0, not 0.07, so the full duration is covered
-    expect(plan[0]).toMatchObject({ sequence: 0, startSec: 0 });
-    expect(plan[0].durationSec).toBeCloseTo(2.5, 2);
-    // Segment 1 starts at the second keyframe and runs to the end.
+    expect(plan[0]).toMatchObject({ sequence: 0, startSec: 0.07 });
+    expect(plan[0].durationSec).toBeCloseTo(2.43, 2);
     expect(plan[1]).toMatchObject({ sequence: 1, startSec: 2.5 });
   });
 

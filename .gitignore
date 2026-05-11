@@ -30,3 +30,4 @@ app/.env.local
 app/.env.*.local
 *-debug.log
 ui-debug.log
+.omc/
