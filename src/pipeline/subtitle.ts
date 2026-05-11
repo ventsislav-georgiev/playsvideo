@@ -18,7 +18,13 @@ export interface ExtractSubtitleDataOptions {
 }
 
 export interface StreamSubtitleOptions {
-  onBatch: (batch: SubtitleCueEntry[], done: boolean, totalCues: number, codec: string) => void;
+  onBatch: (
+    batch: SubtitleCueEntry[],
+    done: boolean,
+    totalCues: number,
+    codec: string,
+    meta?: SubtitleStreamBatchMeta,
+  ) => void;
   onProgress?: (progress: SubtitleExtractionProgress) => void;
   signal?: AbortSignal;
   /** Cues per first batch (fast initial display). Default 20. */
@@ -31,6 +37,16 @@ export interface StreamSubtitleOptions {
   endTimeSec?: number;
   /** Maximum duration in ms for this extraction run. Stops early to yield demux to segments. */
   maxDurationMs?: number;
+}
+
+export type SubtitleStreamStopReason = 'end' | 'endTime' | 'timeout' | 'aborted';
+
+export interface SubtitleStreamBatchMeta {
+  stopReason?: SubtitleStreamStopReason;
+  windowComplete?: boolean;
+  timedOut?: boolean;
+  requestedEndTimeSec?: number;
+  lastCueEndSec?: number;
 }
 
 /** Discover subtitle tracks from a demuxed input. Cheap — reads only metadata, no cue extraction. */
@@ -136,6 +152,8 @@ export async function extractSubtitleDataStreaming(
   let lastReportedCues = 0;
   let totalCuesSent = 0;
   let pending: SubtitleCue[] = [];
+  let stopReason: SubtitleStreamStopReason = 'end';
+  let lastCueEndSec: number | undefined;
 
   const reportProgress = (phase: SubtitleExtractionPhase, cuesRead: number): void => {
     options.onProgress?.({ trackIndex, codec, phase, cuesRead, elapsedMs: performance.now() - startedAt });
@@ -144,8 +162,16 @@ export async function extractSubtitleDataStreaming(
   const flushBatch = (done: boolean): void => {
     if (pending.length === 0 && !done) return;
     const cleaned = cleanCues(pending, codec);
+    const lastCue = cleaned[cleaned.length - 1];
+    if (lastCue) lastCueEndSec = lastCue.endSec;
     totalCuesSent += cleaned.length;
-    options.onBatch(cleaned, done, totalCuesSent, codec);
+    options.onBatch(cleaned, done, totalCuesSent, codec, done ? {
+      stopReason,
+      windowComplete: stopReason === 'end' || stopReason === 'endTime',
+      timedOut: stopReason === 'timeout',
+      requestedEndTimeSec: options.endTimeSec,
+      lastCueEndSec,
+    } : undefined);
     pending = [];
   };
 
@@ -159,11 +185,20 @@ export async function extractSubtitleDataStreaming(
 
   let totalRead = 0;
   for await (const cue of cueIterator) {
-    if (options.signal?.aborted) break;
-    if (options.maxDurationMs && performance.now() - startedAt > options.maxDurationMs) break;
+    if (options.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
+    if (options.maxDurationMs && performance.now() - startedAt > options.maxDurationMs) {
+      stopReason = 'timeout';
+      break;
+    }
     // getCuesFrom may return a few cues from the preceding cluster, skip them
     if (options.startTimeSec != null && cue.timestamp < options.startTimeSec) continue;
-    if (options.endTimeSec != null && cue.timestamp > options.endTimeSec) break;
+    if (options.endTimeSec != null && cue.timestamp > options.endTimeSec) {
+      stopReason = 'endTime';
+      break;
+    }
     pending.push(cue);
     totalRead++;
 
@@ -306,8 +341,46 @@ function extractAssDialogueText(line: string): string {
   if (hasAssStylePayloadFields(fields)) {
     return fields[6];
   }
+  const probableText = extractProbableAssDialogueText(fields);
+  if (probableText != null) {
+    return probableText;
+  }
 
   return line;
+}
+
+function extractProbableAssDialogueText(fields: string[]): string | undefined {
+  const effectIndex = findProbableAssEffectFieldIndex(fields);
+  if (effectIndex != null && effectIndex + 1 < fields.length) {
+    return fields.slice(effectIndex + 1).join(',');
+  }
+
+  const overrideTagIndex = fields.findIndex((field) => /\{\s*\\/.test(field));
+  if (overrideTagIndex !== -1) {
+    return fields.slice(overrideTagIndex).join(',');
+  }
+
+  return undefined;
+}
+
+function findProbableAssEffectFieldIndex(fields: string[]): number | undefined {
+  for (let i = 0; i < fields.length - 1; i++) {
+    if (fields[i].trim() !== '') continue;
+    if (!hasAssStyleOrSpeakerFields(fields.slice(0, i))) continue;
+
+    return i;
+  }
+
+  return undefined;
+}
+
+function hasAssStyleOrSpeakerFields(fields: string[]): boolean {
+  return fields.some((field) => {
+    const value = field.trim();
+    return value.length > 0
+      && !isIntegerField(value)
+      && !isAssTimestamp(value);
+  });
 }
 
 function splitAssFields(line: string): string[] {

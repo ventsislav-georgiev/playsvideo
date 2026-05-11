@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   cleanAssText,
   extractSubtitleData,
+  extractSubtitleDataStreaming,
   parseSubtitleFile,
   subtitleDataToWebVTT,
 } from '../../src/pipeline/subtitle.js';
@@ -181,6 +182,22 @@ describe('ASS/SSA subtitle cleaning', () => {
     expect(text).toBe('Hello, world\nagain');
   });
 
+  it('strips unrecognized ASS metadata before override-tagged text', () => {
+    const text = cleanAssText(
+      '12,0,Default,ALICE,PrimaryColour=&H00FF00&,OutlineColour=&H000000&,,{\\c&H00FF00&}Hello, world',
+    );
+
+    expect(text).toBe('Hello, world');
+  });
+
+  it('strips speaker and style fields from partial ASS payloads', () => {
+    const text = cleanAssText(
+      '12,0,Default,BOB,0,0,0,,The actual line, with a comma',
+    );
+
+    expect(text).toBe('The actual line, with a comma');
+  });
+
   it('cleans embedded ASS cues during extraction', async () => {
     const input = {
       async getSubtitleTracks() {
@@ -278,5 +295,68 @@ Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello`;
 
     expect(data.header).toContain('[Events]');
     expect(phases).toEqual(['starting', 'reading-cues', 'exporting-text', 'done']);
+  });
+});
+
+describe('extractSubtitleDataStreaming', () => {
+  function makeStreamingInput(cues: Array<{ timestamp: number; duration: number; text: string }>) {
+    return {
+      async getSubtitleTracks() {
+        return [
+          {
+            codec: 'srt',
+            async *getCues() {
+              for (const cue of cues) yield cue;
+            },
+            async *getCuesFrom(startTimeSec: number) {
+              for (const cue of cues) {
+                if (cue.timestamp >= startTimeSec) yield cue;
+              }
+            },
+          },
+        ];
+      },
+    };
+  }
+
+  it('reports completed windows when it reaches the requested end time', async () => {
+    const batches: Array<{ done: boolean; meta?: { windowComplete?: boolean; stopReason?: string } }> = [];
+    const input = makeStreamingInput([
+      { timestamp: 0, duration: 1, text: 'zero' },
+      { timestamp: 10, duration: 1, text: 'ten' },
+      { timestamp: 21, duration: 1, text: 'outside' },
+    ]);
+
+    await extractSubtitleDataStreaming(input as any, 0, {
+      endTimeSec: 20,
+      onBatch(_cues, done, _totalCues, _codec, meta) {
+        batches.push({ done, meta });
+      },
+    });
+
+    expect(batches.at(-1)).toMatchObject({
+      done: true,
+      meta: { stopReason: 'endTime', windowComplete: true },
+    });
+  });
+
+  it('reports incomplete windows when extraction times out', async () => {
+    const batches: Array<{ done: boolean; meta?: { timedOut?: boolean; windowComplete?: boolean; stopReason?: string } }> = [];
+    const input = makeStreamingInput(
+      Array.from({ length: 5 }, (_, i) => ({ timestamp: i, duration: 1, text: `cue-${i}` })),
+    );
+
+    await extractSubtitleDataStreaming(input as any, 0, {
+      endTimeSec: 600,
+      maxDurationMs: -1,
+      onBatch(_cues, done, _totalCues, _codec, meta) {
+        batches.push({ done, meta });
+      },
+    });
+
+    expect(batches.at(-1)).toMatchObject({
+      done: true,
+      meta: { stopReason: 'timeout', timedOut: true, windowComplete: false },
+    });
   });
 });

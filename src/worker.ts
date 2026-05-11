@@ -1171,7 +1171,7 @@ async function handleSubtitle(
   let hasSentStart = false;
   const subInput = await ensureSubtitleInput();
   const { codec } = await extractSubtitleDataStreaming(subInput, trackIndex, {
-    onBatch(cues, done, totalCues, batchCodec) {
+    onBatch(cues, done, totalCues, batchCodec, meta) {
       const message: WorkerSubtitleBatchMessage = {
         type: 'subtitle-batch',
         trackIndex,
@@ -1180,6 +1180,11 @@ async function handleSubtitle(
         cues,
         done,
         totalCues,
+        stopReason: meta?.stopReason,
+        windowComplete: meta?.windowComplete,
+        timedOut: meta?.timedOut,
+        requestedEndTimeSec: meta?.requestedEndTimeSec,
+        lastCueEndSec: meta?.lastCueEndSec,
       };
       self.postMessage(message);
     },
@@ -1190,7 +1195,7 @@ async function handleSubtitle(
     signal,
     startTimeSec: seekTimeSec,
     endTimeSec,
-    maxDurationMs: 3000,
+    maxDurationMs: 10000,
   });
 
   subtitleAbort = null;

@@ -155,6 +155,24 @@ describe('PlaysVideoEngine HLS startup', () => {
     expect(unsafeEngine._hlsLoadStarted).toBe(true);
   });
 
+  it('keeps HLS loading active after user seek while playback is already loading', () => {
+    const { video, unsafeEngine, hls } = createEngineForHlsStartup();
+    unsafeEngine.setInitialStartTime(10);
+    unsafeEngine._hlsMediaAttached = true;
+    unsafeEngine._hlsManifestParsed = true;
+    unsafeEngine._hlsSourceOpenFired = true;
+
+    video.currentTime = 10;
+    unsafeEngine.tryStartHlsLoad('initial play');
+
+    video.currentTime = 120;
+    unsafeEngine._onVideoSeeked();
+
+    expect(hls.stopLoad).not.toHaveBeenCalled();
+    expect(hls.startLoad).toHaveBeenCalledTimes(1);
+    expect(unsafeEngine._hlsLoadStarted).toBe(true);
+  });
+
   it('keeps loaded embedded subtitle cues and requests a seek window after user seek', () => {
     const { video, unsafeEngine } = createEngineForHlsStartup();
     const postMessage = vi.fn();

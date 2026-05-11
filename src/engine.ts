@@ -53,6 +53,7 @@ import type {
 import type { TranscodeWorkerSnapshot, TranscodeWorkerStateMessage } from './transcode-protocol.js';
 import type {
   WorkerSegmentStateMessage,
+  WorkerSubtitleBatchMessage,
   WorkerSubtitleProgressMessage,
 } from './worker-protocol.js';
 import { AudioTrackManager, type AudioTrackSelectionEvent } from './audio-track-manager.js';
@@ -166,6 +167,10 @@ export interface EngineOptions {
 export interface LoadStartOptions {
   /** Initial playback position in seconds. Used to start HLS loading at the resume target. */
   startTimeSec?: number;
+  /** Optional source preference order for URL loads. Defaults to direct/native first. */
+  preferenceOrder?: PlaybackMode[];
+  /** Optional playback policy for URL loads. */
+  playbackPolicy?: PlaybackPolicy;
 }
 
 export interface LoadWithOptionsInput {
@@ -182,6 +187,7 @@ export interface ExternalSubtitleOptions {
   label?: string;
   language?: string;
   kind?: 'subtitles' | 'captions';
+  clearEmbedded?: boolean;
 }
 
 export interface SubtitleSeekingOptions {
@@ -362,6 +368,11 @@ export class PlaysVideoEngine extends EventTarget {
   private _hlsSourceOpenFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _deferredHlsStartPosition: number | null = null;
   private _internalHlsSeekTarget: number | null = null;
+  private _hlsGeneration = 0;
+
+  private _onVideoTimeUpdate = (): void => {
+    this.checkSubtitlePrefetch();
+  };
 
   private _onVideoPause = (): void => {
     if (this.hls) {
@@ -428,10 +439,12 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private scheduleHlsSourceOpenFallback(): void {
+    const hlsGeneration = this._hlsGeneration;
     if (this._hlsSourceOpenFired || this._hlsSourceOpenFallbackTimer !== null) return;
 
     this._hlsSourceOpenFallbackTimer = setTimeout(() => {
       this._hlsSourceOpenFallbackTimer = null;
+      if (this._hlsGeneration !== hlsGeneration) return;
       if (this._hlsSourceOpenFired || this._hlsLoadStarted) return;
 
       this._hlsSourceOpenFired = true;
@@ -447,6 +460,21 @@ export class PlaysVideoEngine extends EventTarget {
     this._hlsSourceOpenFallbackTimer = null;
   }
 
+  private resetHlsRuntimeState(): void {
+    this._hlsLoadStarted = false;
+    this._hlsMediaAttached = false;
+    this._hlsManifestParsed = false;
+    this._hlsSourceOpenFired = false;
+    this.clearHlsSourceOpenFallback();
+    this._deferredHlsStartPosition = null;
+    this._internalHlsSeekTarget = null;
+  }
+
+  private invalidateHlsRuntimeState(): void {
+    this._hlsGeneration += 1;
+    this.resetHlsRuntimeState();
+  }
+
 
   private _onVideoSeeked = (): void => {
     const seekTime = this.video.currentTime;
@@ -456,18 +484,16 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     mlog(`video seeked → t=${seekTime.toFixed(3)}, re-requesting embedded subtitles`);
+    this._lastBufferedGapsBySegment.clear();
     this.restartEmbeddedSubtitlesFromPosition(seekTime);
 
     if (this.hls) {
-      if (Number.isFinite(seekTime) && seekTime > 0) {
+      if (!this._hlsLoadStarted && Number.isFinite(seekTime) && seekTime > 0) {
         this._initialStartTimeSec = seekTime;
       }
       if (this._hlsLoadStarted) {
-        this.hls.stopLoad();
-        this._hlsLoadStarted = false;
-        mlog(`video seeked → hls.stopLoad before restart at ${seekTime.toFixed(3)}`);
-      }
-      if (!this.video.paused) {
+        mlog(`video seeked → keeping hls load active at ${seekTime.toFixed(3)}`);
+      } else if (!this.video.paused) {
         this.tryStartHlsLoad('video seeked');
       } else {
         mlog(`video seeked → deferred hls restart while paused at ${seekTime.toFixed(3)}`);
@@ -563,7 +589,7 @@ export class PlaysVideoEngine extends EventTarget {
       transcodeWorkers: options.transcodeWorkers ?? defaultTranscodeWorkerCount(),
       embeddedSubtitlePolicy: options.embeddedSubtitlePolicy ?? 'auto',
     };
-    this.video.addEventListener('timeupdate', () => this.checkSubtitlePrefetch());
+    this.video.addEventListener('timeupdate', this._onVideoTimeUpdate);
   }
 
   loadFile(file: File, opts?: { keyframeIndex?: KeyframeIndex } & LoadStartOptions): void {
@@ -604,8 +630,8 @@ export class PlaysVideoEngine extends EventTarget {
           { mode: 'hls' },
         ]
       : null;
-    this._sourcePreferenceOrder = null;
-    this._sourcePlaybackPolicy = 'auto';
+    this._sourcePreferenceOrder = opts?.preferenceOrder ? [...opts.preferenceOrder] : null;
+    this._sourcePlaybackPolicy = opts?.playbackPolicy ?? 'auto';
     this.createWorker();
     this.worker!.postMessage({ type: 'open-url', url });
     mlog(`open url=${url}`);
@@ -623,7 +649,10 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     const webvtt = subtitleDataToWebVTT(data);
-    this.clearExternalSubtitles();
+    this.clearExternalSubtitles({ restoreDefault: false });
+    if (options.clearEmbedded !== false) {
+      this.removeSubtitleTracks('embedded');
+    }
     this.addSubtitleTrack({
       webvtt,
       source: 'external',
@@ -635,9 +664,11 @@ export class PlaysVideoEngine extends EventTarget {
     });
   }
 
-  clearExternalSubtitles(): void {
+  clearExternalSubtitles(options: { restoreDefault?: boolean } = {}): void {
     this.removeSubtitleTracks('external');
-    this.restoreDefaultTextTrack();
+    if (options.restoreDefault !== false) {
+      this.restoreDefaultTextTrack();
+    }
   }
 
   /**
@@ -703,6 +734,7 @@ export class PlaysVideoEngine extends EventTarget {
       this.hls.destroy();
       this.hls = null;
     }
+    this.invalidateHlsRuntimeState();
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
@@ -719,7 +751,7 @@ export class PlaysVideoEngine extends EventTarget {
 
     this.playlist = null;
     this.initData = null;
-    this.pendingSegments.clear();
+    this.rejectPendingMediaRequests(new DOMException('Playback reset', 'AbortError'));
     this.segmentRequestTimes.clear();
     this.subtitleRequestTimes.clear();
     this.subtitleWindowEnd.clear();
@@ -782,8 +814,6 @@ export class PlaysVideoEngine extends EventTarget {
     this._segmentStates.clear();
     this._lastInternalErrorMessage = null;
     this._lastInternalErrorAt = 0;
-    this.clearHlsSourceOpenFallback();
-    this._internalHlsSeekTarget = null;
 
     this.dispatchEvent(new CustomEvent('loading', { detail }));
     this.dispatchSegmentStateChange();
@@ -933,17 +963,16 @@ export class PlaysVideoEngine extends EventTarget {
     }
 
     if (!this.worker || this._passthrough) return false;
-    this.pendingSegments.clear();
+    this.rejectPendingMediaRequests(new DOMException('Audio track changed', 'AbortError'));
     this.segmentRequestTimes.clear();
     this._segmentStates.clear();
     this.playlist = null;
     this.initData = null;
-    this.pendingPlaylist = null;
-    this.pendingInit = null;
     if (this.hls) {
       this.hls.destroy();
       this.hls = null;
     }
+    this.invalidateHlsRuntimeState();
     if (this.audioTrackManager) {
       this.audioTrackManager.destroy();
       this.audioTrackManager = null;
@@ -1002,7 +1031,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._source = null;
     this._sourceDemux?.dispose();
     this._sourceDemux = null;
-    this.pendingSegments.clear();
+    this.rejectPendingMediaRequests(new DOMException('Playback destroyed', 'AbortError'));
     this.segmentRequestTimes.clear();
     this.subtitleRequestTimes.clear();
     this.subtitleWindowEnd.clear();
@@ -1013,9 +1042,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._lastInternalErrorMessage = null;
     this._lastInternalErrorAt = 0;
     this._initialStartTimeSec = null;
-    this._hlsLoadStarted = false;
-    this.clearHlsSourceOpenFallback();
-    this._internalHlsSeekTarget = null;
+    this.invalidateHlsRuntimeState();
     this.dispatchSegmentStateChange();
   }
 
@@ -1104,7 +1131,7 @@ export class PlaysVideoEngine extends EventTarget {
     const target = this._internalHlsSeekTarget;
     if (target === null) return false;
     this._internalHlsSeekTarget = null;
-    return Math.abs(seekTime - target) <= 0.25;
+    return Math.abs(seekTime - target) <= 0.5;
   }
 
   private consumeHlsStartPosition(): number {
@@ -1323,7 +1350,7 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private evaluateInitialPlayback(media: PlaybackMediaMetadata): PlaybackEvaluationResult {
-    const options = this._blobUrl
+    const baseOptions = this._blobUrl
       ? [
           { mode: 'direct-bytes', mimeType: this._pendingFileType, url: this._blobUrl } as const,
           { mode: 'hls' } as const,
@@ -1331,11 +1358,16 @@ export class PlaysVideoEngine extends EventTarget {
       : this._sourcePlaybackOptions
         ? this._sourcePlaybackOptions
       : ([{ mode: 'hls' }] as const);
+    const options =
+      this._sourcePlaybackPolicy === 'force-hls'
+        ? baseOptions.filter((option) => option.mode === 'hls')
+        : baseOptions;
 
     return evaluatePlaybackOptions({
       options: [...options],
       media,
       capabilities: this.createPlaybackCapabilities(),
+      preferenceOrder: this._sourcePreferenceOrder ?? undefined,
     });
   }
 
@@ -1663,6 +1695,9 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private requestSegment(index: number): Promise<ArrayBuffer> {
+    if (!this.worker) {
+      return Promise.reject(new DOMException('Playback pipeline is not active', 'AbortError'));
+    }
     // Race detection: duplicate request for same segment
     if (this.pendingSegments.has(index)) {
       mlog(`WARN duplicate request for seg ${index} (already pending)`);
@@ -1681,6 +1716,24 @@ export class PlaysVideoEngine extends EventTarget {
       this.pendingSegments.set(index, { resolve, reject });
       this.worker!.postMessage({ type: 'segment', index });
     });
+  }
+
+  private rejectPendingMediaRequests(err: Error): void {
+    for (const [index, pending] of this.pendingSegments) {
+      this.noteSegmentState(index, 'canceled');
+      pending.reject(err);
+    }
+    this.pendingSegments.clear();
+
+    if (this.pendingInit) {
+      this.pendingInit.reject(err);
+      this.pendingInit = null;
+    }
+
+    if (this.pendingPlaylist) {
+      this.pendingPlaylist.reject(err);
+      this.pendingPlaylist = null;
+    }
   }
 
   private cancelSegment(index: number): void {
@@ -2000,8 +2053,12 @@ export class PlaysVideoEngine extends EventTarget {
       return;
     }
 
+    this.invalidateHlsRuntimeState();
+    const hlsGeneration = this._hlsGeneration;
+
     // Need to capture `this` for the loader classes
     const engine = this;
+    const isCurrentHls = (): boolean => engine._hlsGeneration === hlsGeneration;
     const completeStats = (stats: LoaderStats, byteLength: number): void => {
       const now = performance.now();
       stats.loaded = byteLength;
@@ -2021,11 +2078,17 @@ export class PlaysVideoEngine extends EventTarget {
       ) {
         this.context = context;
         this.stats = makeStats();
+        if (!isCurrentHls()) {
+          this.stats.aborted = true;
+          callbacks.onAbort?.(this.stats, context, null);
+          return;
+        }
         mlog(`hls loader playlist start url=${context.url}`);
 
         if (engine.playlist) {
           const data = engine.playlist;
           queueMicrotask(() => {
+            if (!isCurrentHls()) return;
             completeStats(this.stats, data.length);
             mlog(`hls loader playlist success bytes=${data.length}`);
             callbacks.onProgress?.(this.stats, context, data, null);
@@ -2034,12 +2097,14 @@ export class PlaysVideoEngine extends EventTarget {
         } else {
           engine.pendingPlaylist = {
             resolve: (data) => {
+              if (!isCurrentHls()) return;
               completeStats(this.stats, data.length);
               mlog(`hls loader playlist success bytes=${data.length}`);
               callbacks.onProgress?.(this.stats, context, data, null);
               callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
             },
             reject: (err) => {
+              if (!isCurrentHls()) return;
               mlog(`hls loader playlist error ${normalizeErrorMessage(err.message)}`);
               callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
             },
@@ -2067,6 +2132,12 @@ export class PlaysVideoEngine extends EventTarget {
         this.callbacks = callbacks;
         this.stats = makeStats();
         this.aborted = false;
+        if (!isCurrentHls()) {
+          this.aborted = true;
+          this.stats.aborted = true;
+          callbacks.onAbort?.(this.stats, context, null);
+          return;
+        }
         const url = context.url;
 
         if (url.includes('init.mp4')) {
@@ -2089,6 +2160,7 @@ export class PlaysVideoEngine extends EventTarget {
         if (engine.initData) {
           const data = engine.initData;
           queueMicrotask(() => {
+            if (!isCurrentHls() || this.aborted) return;
             completeStats(this.stats, data.byteLength);
             mlog(`hls loader init success bytes=${data.byteLength}`);
             callbacks.onProgress?.(this.stats, context, data, null);
@@ -2097,12 +2169,14 @@ export class PlaysVideoEngine extends EventTarget {
         } else {
           engine.pendingInit = {
             resolve: (data) => {
+              if (!isCurrentHls() || this.aborted) return;
               completeStats(this.stats, data.byteLength);
               mlog(`hls loader init success bytes=${data.byteLength}`);
               callbacks.onProgress?.(this.stats, context, data, null);
               callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
             },
             reject: (err) => {
+              if (!isCurrentHls() || this.aborted) return;
               mlog(`hls loader init error ${normalizeErrorMessage(err.message)}`);
               callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
             },
@@ -2117,12 +2191,18 @@ export class PlaysVideoEngine extends EventTarget {
       ) {
         this.currentSegmentIndex = index;
         mlog(`hls loader seg ${index} start`);
+        if (!isCurrentHls()) {
+          this.aborted = true;
+          this.stats.aborted = true;
+          callbacks.onAbort?.(this.stats, context, null);
+          return;
+        }
         const segmentPromise = engine._source
           ? engine.requestSourceSegment(index)
           : engine.requestSegment(index);
         segmentPromise
           .then((data) => {
-            if (this.aborted) {
+            if (this.aborted || !isCurrentHls()) {
               return;
             }
             this.currentSegmentIndex = null;
@@ -2132,7 +2212,7 @@ export class PlaysVideoEngine extends EventTarget {
             callbacks.onSuccess({ url: context.url, data, code: 200 }, this.stats, context, null);
           })
           .catch((err) => {
-            if (this.aborted) {
+            if (this.aborted || !isCurrentHls()) {
               return;
             }
             this.currentSegmentIndex = null;
@@ -2210,6 +2290,7 @@ export class PlaysVideoEngine extends EventTarget {
       nudgeMaxRetry: 6,
       highBufferWatchdogPeriod: 1,
     });
+    const hls = this.hls;
 
 
     this.video.addEventListener('pause', this._onVideoPause);
@@ -2221,30 +2302,35 @@ export class PlaysVideoEngine extends EventTarget {
       );
     });
 
-    this.hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       this._hlsMediaAttached = true;
       mlog('hls MEDIA_ATTACHED');
       this.tryStartHlsLoad('hls MEDIA_ATTACHED');
     });
 
-    this.hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+    hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       this._hlsManifestParsed = true;
       mlog(`hls MANIFEST_PARSED levels=${data.levels.length}`);
       this.tryStartHlsLoad('hls MANIFEST_PARSED');
       // NOTE: Autoplay is deferred until playback gate (FRAG_BUFFERED) to ensure segments are ready
     });
 
-    this.hls.on(Hls.Events.FRAG_LOADING, (_evt, data) => {
+    hls.on(Hls.Events.FRAG_LOADING, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       mlog(`hls FRAG_LOADING sn=${data.frag.sn} url=${data.frag.relurl}`);
     });
 
-    this.hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
+    hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       mlog(
         `hls FRAG_LOADED sn=${data.frag.sn} bytes=${data.payload.byteLength}`,
       );
     });
 
-    this.hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
+    hls.on(Hls.Events.FRAG_BUFFERED, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       // Playback gate: trigger autoplay once minimum segments are buffered
       segmentsBuffered++;
       if (
@@ -2303,7 +2389,8 @@ export class PlaysVideoEngine extends EventTarget {
       }
     });
 
-    this.hls.on(Hls.Events.ERROR, (_evt, data) => {
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       const underlyingMessage =
         data.error?.message ?? data.reason ?? data.response?.text ?? data.err?.message ?? null;
       const fragSn = data.frag?.sn ?? null;
@@ -2334,16 +2421,16 @@ export class PlaysVideoEngine extends EventTarget {
       }
     });
 
-    this.hls.attachMedia(this.video);
+    hls.attachMedia(this.video);
 
     // Initialize audio track manager
-    if (this.hls && this._contentId) {
+    if (this.hls === hls && this._contentId) {
       if (this.audioTrackManager) this.audioTrackManager.destroy();
       this.audioTrackManager = new AudioTrackManager({
         storageKeyPrefix: 'bookplay_audio_track',
         debug: false,
       });
-      this.audioTrackManager.initialize(this.hls, this.video, this._contentId);
+      this.audioTrackManager.initialize(hls, this.video, this._contentId);
       
       // Wire up audio track selection events to engine event system
       this.audioTrackManager.on((evt: AudioTrackSelectionEvent) => {
@@ -2357,21 +2444,22 @@ export class PlaysVideoEngine extends EventTarget {
         }
       });
     }
-    this.hls.loadSource('/virtual/playlist.m3u8');
+    hls.loadSource('/virtual/playlist.m3u8');
 
     // Safari-critical: listen for sourceopen to gate HLS startup
     const onSourceOpen = () => {
+      if (this.hls !== hls || !isCurrentHls()) return;
       this._hlsSourceOpenFired = true;
       this.clearHlsSourceOpenFallback();
       mlog('MediaSource sourceopen fired');
       this.tryStartHlsLoad('MediaSource sourceopen');
       // Remove listener after first fire
-      const ms = (this.hls?.media as any)?.mediaSource;
+      const ms = (hls.media as any)?.mediaSource;
       if (ms) {
         ms.removeEventListener('sourceopen', onSourceOpen);
       }
     };
-    const ms = (this.hls?.media as any)?.mediaSource;
+    const ms = (hls.media as any)?.mediaSource;
     if (ms) {
       ms.addEventListener('sourceopen', onSourceOpen);
     }
@@ -2472,14 +2560,7 @@ export class PlaysVideoEngine extends EventTarget {
     setInterval(healthCheck, 2000);
   }
 
-  private handleSubtitleBatch(msg: {
-    trackIndex: number;
-    requestId?: number;
-    codec: string;
-    cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
-    done: boolean;
-    totalCues: number;
-  }): void {
+  private handleSubtitleBatch(msg: WorkerSubtitleBatchMessage): void {
     if (
       msg.requestId !== undefined &&
       this._activeSubtitleRequestIds.get(msg.trackIndex) !== msg.requestId
@@ -2492,7 +2573,7 @@ export class PlaysVideoEngine extends EventTarget {
       (a) => a.source === 'embedded' && a.trackIndex === msg.trackIndex,
     );
 
-    const shouldSelect = this._selectOnExtract.get(msg.trackIndex) ?? true;
+    const shouldSelect = this._selectOnExtract.get(msg.trackIndex) ?? false;
 
     if (!attached) {
       const info = this._subtitleTracks.find((t) => t.index === msg.trackIndex);
@@ -2555,7 +2636,7 @@ export class PlaysVideoEngine extends EventTarget {
 
     if (msg.done) {
       const requestedEnd = this.subtitleRequestedWindowEnd.get(msg.trackIndex);
-      if (requestedEnd !== undefined) {
+      if (requestedEnd !== undefined && msg.windowComplete !== false) {
         const prev = this.subtitleWindowEnd.get(msg.trackIndex) ?? 0;
         if (requestedEnd > prev) {
           this.subtitleWindowEnd.set(msg.trackIndex, requestedEnd);
@@ -2577,7 +2658,12 @@ export class PlaysVideoEngine extends EventTarget {
       this.dispatchSubtitleStatus(
         `Subtitle track ${msg.trackIndex}: ${lang} ${msg.codec} ${msg.totalCues} cues (streamed)`,
       );
-      mlog(`subtitle track ${msg.trackIndex} complete: ${msg.totalCues} cues`);
+      mlog(
+        `subtitle track ${msg.trackIndex} complete: ${msg.totalCues} cues reason=${msg.stopReason ?? 'unknown'} windowComplete=${msg.windowComplete !== false}`,
+      );
+      if (msg.timedOut) {
+        this.checkSubtitlePrefetch();
+      }
     }
   }
 
@@ -2670,6 +2756,8 @@ export class PlaysVideoEngine extends EventTarget {
       if (trackIndex == null) continue;
       const info = this._subtitleTracks.find((t) => t.index === trackIndex);
       if (info) {
+        const loadedUntil = this.subtitleWindowEnd.get(trackIndex) ?? 0;
+        if (loadedUntil > seekTimeSec + 120) continue;
         this.requestEmbeddedSubtitleTrack(info, seekTimeSec);
       }
     }
@@ -2680,16 +2768,9 @@ export class PlaysVideoEngine extends EventTarget {
 
     if (this.subtitleWindowEnd.size === 0) return;
 
-    // Don't prefetch subtitles when video buffer is low — segments need the demux
-    const buffered = this.video.buffered;
-    if (buffered.length > 0) {
-      const bufferEnd = buffered.end(buffered.length - 1);
-      if (bufferEnd - this.video.currentTime < 15) return;
-    }
-
     const currentTime = this.video.currentTime;
-    const SUBTITLE_WINDOW_SEC = 180;
-    const PREFETCH_AHEAD_SEC = 60;
+    const SUBTITLE_WINDOW_SEC = 600;
+    const PREFETCH_AHEAD_SEC = 120;
 
     for (const [trackIndex, windowEnd] of this.subtitleWindowEnd) {
       if (this.subtitleWindowLoading.has(trackIndex)) continue;
@@ -2799,9 +2880,11 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   private requestEmbeddedSubtitleTrack(track: SubtitleTrackInfo, seekTimeSec?: number): void {
-    const SUBTITLE_WINDOW_SEC = 180;
+    const SUBTITLE_WINDOW_SEC = 600;
     const startSec = seekTimeSec ?? 0;
-    const endTimeSec = startSec + SUBTITLE_WINDOW_SEC;
+    const requestedEndTimeSec = startSec + SUBTITLE_WINDOW_SEC;
+    const durationSec = Number.isFinite(this._durationSec) && this._durationSec > 0 ? this._durationSec : null;
+    const endTimeSec = durationSec === null ? requestedEndTimeSec : Math.min(requestedEndTimeSec, durationSec);
     const requestedAtMs = Date.now();
     const requestId = this.nextSubtitleRequestId(track.index);
     this.subtitleRequestTimes.set(track.index, requestedAtMs);

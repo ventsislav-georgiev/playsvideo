@@ -17,6 +17,8 @@ export interface WorkerSegmentStateMessage {
 
 export type WorkerSubtitlePhase = 'starting' | 'reading-cues' | 'exporting-text';
 
+export type WorkerSubtitleStopReason = 'end' | 'endTime' | 'timeout' | 'aborted';
+
 export interface WorkerSubtitleProgressMessage {
   type: 'subtitle-progress';
   trackIndex: number;
@@ -37,4 +39,9 @@ export interface WorkerSubtitleBatchMessage {
   cues: Array<{ startSec: number; endSec: number; text: string; settings?: string }>;
   done: boolean;
   totalCues: number;
+  stopReason?: WorkerSubtitleStopReason;
+  windowComplete?: boolean;
+  timedOut?: boolean;
+  requestedEndTimeSec?: number;
+  lastCueEndSec?: number;
 }
