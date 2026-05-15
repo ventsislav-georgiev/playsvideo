@@ -18,6 +18,7 @@ import {
   type PlaybackMode,
   type PlaybackOption,
   type PlaybackOptionEvaluation,
+  type QualitySwitchEvent,
 } from './playback-selection.js';
 import { getAv1Fallback, getAv1UnsupportedMessage, getAv1MalformedMessage, detectAv1Support, validateAv1Metadata } from './av1-capability.js';
 import {
@@ -233,6 +234,8 @@ interface EngineEventMap {
   workerstatechange: CustomEvent<WorkerStateDetail>;
   segmentstatechange: CustomEvent<SegmentStateDetail>;
   playbackdecision: CustomEvent<PlaybackDecisionDetail>;
+  'quality-switching': CustomEvent<QualitySwitchEvent>;
+  'quality-switched': CustomEvent<QualitySwitchEvent>;
 }
 
 interface TranscodeWorkerHandle {
@@ -370,6 +373,8 @@ export class PlaysVideoEngine extends EventTarget {
   private _deferredHlsStartPosition: number | null = null;
   private _internalHlsSeekTarget: number | null = null;
   private _hlsGeneration = 0;
+  private _hlsPreviousLevel: number | null = null;
+  private _hlsFirstLevelSwitchFired = false;
 
   private _onVideoTimeUpdate = (): void => {
     this.checkSubtitlePrefetch();
@@ -466,6 +471,7 @@ export class PlaysVideoEngine extends EventTarget {
     this._hlsMediaAttached = false;
     this._hlsManifestParsed = false;
     this._hlsSourceOpenFired = false;
+    this._hlsFirstLevelSwitchFired = false;
     this.clearHlsSourceOpenFallback();
     this._deferredHlsStartPosition = null;
     this._internalHlsSeekTarget = null;
@@ -733,6 +739,7 @@ export class PlaysVideoEngine extends EventTarget {
 
     if (this.hls) {
       this.hls.destroy();
+      this._hlsPreviousLevel = null;
       this.hls = null;
     }
     this.invalidateHlsRuntimeState();
@@ -977,6 +984,7 @@ export class PlaysVideoEngine extends EventTarget {
     this.initData = null;
     if (this.hls) {
       this.hls.destroy();
+      this._hlsPreviousLevel = null;
       this.hls = null;
     }
     this.invalidateHlsRuntimeState();
@@ -1003,6 +1011,7 @@ export class PlaysVideoEngine extends EventTarget {
 
     if (this.hls) {
       this.hls.destroy();
+      this._hlsPreviousLevel = null;
       this.hls = null;
     }
     if (this.worker) {
@@ -1095,6 +1104,21 @@ export class PlaysVideoEngine extends EventTarget {
     );
   }
 
+  private dispatchQualitySwitching(event: QualitySwitchEvent): void {
+    this.dispatchEvent(
+      new CustomEvent('quality-switching', {
+        detail: event,
+      }),
+    );
+  }
+
+  private dispatchQualitySwitched(event: QualitySwitchEvent): void {
+    this.dispatchEvent(
+      new CustomEvent('quality-switched', {
+        detail: event,
+      }),
+    );
+  }
   private handleTranscodeWorkerMessage(
     id: number,
     event: MessageEvent<TranscodeWorkerStateMessage>,
@@ -2437,6 +2461,65 @@ export class PlaysVideoEngine extends EventTarget {
           );
         }
       }
+    });
+
+    hls.on(Hls.Events.LEVEL_SWITCHING, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
+      
+      // Determine reason for quality switch
+      let reason: 'initial' | 'user-selected' | 'bandwidth-change' | 'error-recovery' = 'bandwidth-change';
+      
+      // First level switch after manifest parsed = initial selection
+      if (!this._hlsFirstLevelSwitchFired && this._hlsManifestParsed) {
+        reason = 'initial';
+        this._hlsFirstLevelSwitchFired = true;
+      }
+      // Check if this is a manual level change (user-selected)
+      else if (this.hls.manualLevel >= 0 && this.hls.manualLevel === data.level) {
+        reason = 'user-selected';
+      }
+      
+      const fromLevel = this._hlsPreviousLevel ?? this.hls.currentLevel;
+      const toLevel = data.level;
+      mlog(`hls LEVEL_SWITCHING from=${fromLevel} to=${toLevel} reason=${reason}`);
+      
+      this.dispatchQualitySwitching({
+        atMs: performance.now(),
+        fromQualityId: fromLevel >= 0 ? String(fromLevel) : null,
+        toQualityId: String(toLevel),
+        reason: reason,
+      });
+    });
+
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_evt, data) => {
+      if (this.hls !== hls || !isCurrentHls()) return;
+      
+      // Determine reason for quality switch (same logic as LEVEL_SWITCHING)
+      let reason: 'initial' | 'user-selected' | 'bandwidth-change' | 'error-recovery' = 'bandwidth-change';
+      
+      // First level switch after manifest parsed = initial selection
+      if (!this._hlsFirstLevelSwitchFired && this._hlsManifestParsed) {
+        reason = 'initial';
+        this._hlsFirstLevelSwitchFired = true;
+      }
+      // Check if this is a manual level change (user-selected)
+      else if (this.hls.manualLevel >= 0 && this.hls.manualLevel === data.level) {
+        reason = 'user-selected';
+      }
+      
+      const level = data.level;
+      const fromLevel = this._hlsPreviousLevel ?? (level > 0 ? level - 1 : null);
+      mlog(`hls LEVEL_SWITCHED from=${fromLevel} to=${level} reason=${reason}`);
+      
+      this.dispatchQualitySwitched({
+        atMs: performance.now(),
+        fromQualityId: fromLevel !== null ? String(fromLevel) : null,
+        toQualityId: String(level),
+        reason: reason,
+      });
+      
+      // Update tracked previous level for next transition
+      this._hlsPreviousLevel = level;
     });
 
     hls.on(Hls.Events.ERROR, (_evt, data) => {
