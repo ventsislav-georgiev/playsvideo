@@ -19,6 +19,17 @@ export interface DirectPlaybackOption {
 
 export type PlaybackOption = HlsPlaybackOption | DirectPlaybackOption;
 
+export interface QualitySwitchEvent {
+  /** Timestamp (ms) when the quality switch event occurred. */
+  atMs: number;
+  /** Previous quality level ID, or null if unknown/initial. */
+  fromQualityId: string | null;
+  /** New quality level ID. */
+  toQualityId: string;
+  /** Reason for the quality switch (e.g., 'auto', 'manual', 'bandwidth'). */
+  reason: string;
+}
+
 export interface PlaybackMediaMetadata {
   /**
    * Container-level short codec names from demux (e.g. `avc`, `ac3`).

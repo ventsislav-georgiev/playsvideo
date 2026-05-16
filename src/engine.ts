@@ -30,6 +30,10 @@ import type { DemuxResult, SegmentBoundaryResolver } from './pipeline/demux.js';
 import { generateVodPlaylist } from './pipeline/playlist.js';
 import { buildSegmentPlan } from './pipeline/segment-plan.js';
 import {
+  convertInnerTubeToPlaybackOptions,
+  type InnerTubePlaybackInput,
+} from './innertube-integration.js';
+import {
   extractSubtitleData,
   parseSubtitleFile,
   subtitleDataToWebVTT,
@@ -182,6 +186,7 @@ export interface LoadWithOptionsInput {
   preferenceOrder?: PlaybackMode[];
   playbackPolicy?: PlaybackPolicy;
   startTimeSec?: number;
+  metadata?: PlaybackMediaMetadata;
 }
 
 export interface ExternalSubtitleOptions {
@@ -730,6 +735,39 @@ export class PlaysVideoEngine extends EventTarget {
     this._sourcePreferenceOrder = input.preferenceOrder ? [...input.preferenceOrder] : null;
     this._sourcePlaybackPolicy = input.playbackPolicy ?? 'auto';
     this.startSourcePipeline(input.source);
+  }
+
+
+  loadInnerTube(input: InnerTubePlaybackInput): void {
+    const playbackResult = convertInnerTubeToPlaybackOptions(input);
+    
+    // Extract deterministic playable URL from manifest in priority order:
+    // 1. HLS (preferred for adaptive streaming)
+    // 2. DASH (adaptive XML manifest)
+    // 3. Direct format URLs (fallback)
+    let playableUrl: string | null = null;
+    
+    if (input.manifest.hlsUrl) {
+      playableUrl = input.manifest.hlsUrl;
+    } else if (input.manifest.dashUrl) {
+      playableUrl = input.manifest.dashUrl;
+    } else if (input.manifest.formats.length > 0 && input.manifest.formats[0].url) {
+      playableUrl = input.manifest.formats[0].url;
+    }
+    
+    if (!playableUrl) {
+      throw new Error(
+        'No playable URL found in InnerTube manifest (no HLS, DASH, or format URLs available)',
+      );
+    }
+    
+    // Load via URL and preserve metadata
+    this.loadUrl(playableUrl);
+    
+    // Attach metadata for downstream consumers
+    // Dispatch metadata through canonical playback decision event
+    const evaluation = this.evaluateInitialPlayback(playbackResult.metadata);
+    this.dispatchPlaybackDecision(playbackResult.metadata, evaluation);
   }
 
   private reset(detail: LoadingDetail): void {

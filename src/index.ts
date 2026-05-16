@@ -32,3 +32,5 @@ export { isAbortableSource, checkAbort } from './pipeline/source-signal.js';
 export { Source } from './source.js';
 export { createCustomControls } from './custom-controls.js';
 export type { CustomControlsOptions, CustomControlsHandle } from './custom-controls.js';
+export type { InnerTubePlaybackInput, InnerTubePlaybackResult } from './innertube-integration.js';
+export type { ExtractedManifest } from './innertube-manifest.js';

@@ -1,4 +1,5 @@
 import { PlaysVideoEngine, languageLabel, normalizeSubtitleLanguageCode } from './engine.js';
+import { type InnerTubePlaybackInput } from './innertube-integration.js';
 import { createCustomControls, type CustomControlsHandle, type SubtitleTrackMeta } from './custom-controls.js';
 import { bindExternalSubtitlePicker } from './external-subtitle-picker.js';
 
@@ -26,6 +27,29 @@ const subtitlePicker = bindExternalSubtitlePicker({
 
 function loadFile(file: File) {
   engine.loadFile(file);
+}
+
+// InnerTube manifest loader (from URL query param)
+async function loadInnerTubeManifest() {
+  const params = new URL(location.href).searchParams;
+  const manifestUrl = params.get('manifest');
+  if (!manifestUrl) return;
+
+  try {
+    status.textContent = `Fetching InnerTube manifest from ${manifestUrl}...`;
+    dropTarget.classList.add('hidden');
+    video.style.display = 'none';
+    playerActions.style.display = 'none';
+
+    const response = await fetch(manifestUrl);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    const manifest = await response.json() as InnerTubePlaybackInput;
+    engine.loadInnerTube(manifest);
+  } catch (err) {
+    status.textContent = `Error loading InnerTube manifest: ${err instanceof Error ? err.message : String(err)}`;
+    dropTarget.classList.remove('hidden');
+  }
 }
 
 // Register service worker
@@ -93,6 +117,9 @@ async function handleShareTarget() {
   history.replaceState(null, '', '/player');
 }
 handleShareTarget();
+
+// Load InnerTube manifest if provided via query param
+loadInnerTubeManifest();
 
 engine.addEventListener('loading', (e) => {
   status.textContent = `Opening ${e.detail.file?.name ?? e.detail.url ?? ''}...`;

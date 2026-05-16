@@ -155,6 +155,7 @@ export function Player() {
                     playbackKey,
                   }
                 : null,
+            innerTubeOptions: undefined,
           }
         : null,
     );

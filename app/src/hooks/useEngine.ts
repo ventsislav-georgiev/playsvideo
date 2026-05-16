@@ -21,6 +21,10 @@ export type EngineSource =
         deviceId: string;
         playbackKey: string;
       } | null;
+      innerTubeOptions?: {
+        source: any;
+        options: any[];
+      };
     }
   | { kind: 'file'; file: File };
 
@@ -470,6 +474,14 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
         setStatus('Getting file access...');
         setNeedsPermission(false);
         pushDiagnosticEvent(diagnosticsRef, 'file-access:start');
+        
+        // Check if InnerTube options are available
+        if (source.kind === 'entry' && source.innerTubeOptions) {
+          pushDiagnosticEvent(diagnosticsRef, 'innertube:load-start');
+          engine.loadWithOptions({ source: source.innerTubeOptions.source, options: source.innerTubeOptions.options });
+          return;
+        }
+        
         const resolved = await getFile(entry!, { requestPermission: false });
         pushDiagnosticEvent(
           diagnosticsRef,

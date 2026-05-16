@@ -15,7 +15,7 @@ class TrackingSource extends Source {
   reads: Array<{ start: number; end: number }> = [];
   private inner: Source;
 
-  constructor(buffer: ArrayBuffer) {
+  constructor(buffer: ArrayBuffer | ArrayBufferView) {
     super();
     this.inner = new BufferSource(buffer);
   }
@@ -48,7 +48,7 @@ describe('read patterns during keyframe index building', () => {
 
   it('MP4: getKeyframeIndex triggers zero additional reads (sample tables are in-memory)', async () => {
     const buffer = await readFile(join(FIXTURES_DIR, 'codec-h264-high.mp4'));
-    const source = new TrackingSource(buffer.buffer as ArrayBuffer);
+    const source = new TrackingSource(buffer);
 
     input = new Input({ formats: ALL_FORMATS, source });
 
@@ -74,7 +74,7 @@ describe('read patterns during keyframe index building', () => {
   it('MKV: getKeyframeIndex triggers reads scattered across the file (cluster seeking)', async () => {
     const buffer = await readFile(join(FIXTURES_DIR, 'test-h264-ac3-10s.mkv'));
     const fileSize = buffer.byteLength;
-    const source = new TrackingSource(buffer.buffer as ArrayBuffer);
+    const source = new TrackingSource(buffer);
 
     input = new Input({ formats: ALL_FORMATS, source });
 
