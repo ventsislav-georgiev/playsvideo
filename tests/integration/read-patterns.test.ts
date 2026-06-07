@@ -8,7 +8,7 @@ const FIXTURES_DIR = join(import.meta.dirname, '..', 'fixtures');
 
 /**
  * Wraps a BufferSource to intercept and record every _read() call.
- * The internal _read/_retrieveSize/_dispose methods are @internal in mediabunny's
+ * The internal _read/_getFileSize/_dispose methods are @internal in mediabunny's
  * typings, so we access them via `as any`.
  */
 class TrackingSource extends Source {
@@ -20,13 +20,13 @@ class TrackingSource extends Source {
     this.inner = new BufferSource(buffer);
   }
 
-  _retrieveSize() {
-    return (this.inner as any)._retrieveSize();
+  _getFileSize() {
+    return (this.inner as any)._getFileSize();
   }
 
-  _read(start: number, end: number) {
+  _read(start: number, end: number, minReadPosition: number, maxReadPosition: number) {
     this.reads.push({ start, end });
-    return (this.inner as any)._read(start, end);
+    return (this.inner as any)._read(start, end, minReadPosition, maxReadPosition);
   }
 
   _dispose() {

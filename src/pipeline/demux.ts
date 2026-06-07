@@ -356,13 +356,28 @@ export class AbortableUrlSource extends Source implements AbortableSource {
 }
 
 class SourceAdapter extends MBSource {
+  // Upstream mediabunny's Source contract uses a synchronous `_getFileSize()`
+  // (size is discovered lazily as a side effect of `_read`) plus a 4-arg
+  // `_read(start, end, minReadPosition, maxReadPosition)`. Our inner sources
+  // expose an async `_retrieveSize()` and a 2-arg `_read(start, end)`, so this
+  // adapter caches the size on first read and ignores the extra read hints.
+  private _cachedSize: number | null | undefined = undefined;
+
   constructor(private _inner: Source) {
     super();
   }
-  _retrieveSize() {
-    return this._inner._retrieveSize();
+  _getFileSize(): number | null | undefined {
+    return this._cachedSize;
   }
-  _read(start: number, end: number) {
+  async _read(
+    start: number,
+    end: number,
+    _minReadPosition: number,
+    _maxReadPosition: number,
+  ) {
+    if (this._cachedSize === undefined) {
+      this._cachedSize = (await this._inner._retrieveSize()) ?? null;
+    }
     return this._inner._read(start, end);
   }
   _dispose() {

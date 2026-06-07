@@ -21,10 +21,6 @@ export type EngineSource =
         deviceId: string;
         playbackKey: string;
       } | null;
-      innerTubeOptions?: {
-        source: any;
-        options: any[];
-      };
     }
   | { kind: 'file'; file: File };
 
@@ -34,20 +30,6 @@ interface DiagnosticEvent {
   at: string;
   label: string;
   detail?: string;
-}
-
-// Phase 2a: Subtitle seeking capability types
-interface SubtitleSeekingCapability {
-  trackIndex: number;
-  hasCuesIndex: boolean;
-  cueCount: number;
-  estimatedLatencyMs: number;
-}
-
-interface SubtitleSeekingState {
-  capability: SubtitleSeekingCapability | null;
-  status: string;
-  isLoading: boolean;
 }
 
 interface UseEngineResult {
@@ -62,12 +44,7 @@ interface UseEngineResult {
   clearExternalSubtitles: () => void;
   copyDiagnostics: () => Promise<void>;
   diagnosticsStatus: string;
-  av1WarningMessage: string;
   savePosition: (reason?: SaveReason) => Promise<void>;
-  // Phase 2a: Subtitle seeking capability
-  subtitleSeekingCapability: SubtitleSeekingCapability | null;
-  seekSubtitle: (trackIndex: number, targetTimeSec: number) => Promise<void>;
-  subtitleSeekingStatus: string;
 }
 
 function pushDiagnosticEvent(
@@ -100,14 +77,6 @@ function formatMediaError(error: MediaError | null): string | null {
   return `code=${error.code}${error.message ? ` message=${error.message}` : ''}`;
 }
 
-function formatTime(sec: number): string {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 async function writeClipboard(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -125,7 +94,11 @@ async function writeClipboard(text: string): Promise<void> {
   document.body.removeChild(textarea);
 }
 
-export function useEngine(source: EngineSource | null): UseEngineResult {
+export function useEngine(
+  source: EngineSource | null,
+  reloadKey = '',
+  externalVideoElement: HTMLVideoElement | null = null,
+): UseEngineResult {
   const entry = source?.kind === 'entry' ? source.entry : null;
   const playback = source?.kind === 'entry' ? source.playback : null;
   const playbackTarget = source?.kind === 'entry' ? source.playbackTarget : null;
@@ -149,30 +122,30 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
   const workerStatesRef = useRef<unknown>(null);
   const segmentStatesRef = useRef<unknown>(null);
   const readyDetailRef = useRef<unknown>(null);
+  const sessionResumeRef = useRef<{ sourceKey: string; positionSec: number } | null>(null);
   const [status, setStatus] = useState('');
   const [phase, setPhase] = useState('idle');
   const [hasEnded, setHasEnded] = useState(false);
   const [subtitleStatus, setSubtitleStatus] = useState('');
   const [diagnosticsStatus, setDiagnosticsStatus] = useState('');
-  const [av1WarningMessage, setAv1WarningMessage] = useState('');
   const [needsPermission, setNeedsPermission] = useState(false);
   const [retryCounter, setRetryCounter] = useState(0);
   const [embeddedSubtitlePolicy] = useSetting<EmbeddedSubtitlePolicy>(
     EMBEDDED_SUBTITLE_POLICY_KEY,
     'auto',
   );
-  // Phase 2a: Subtitle seeking state
-  const [subtitleSeekingState, setSubtitleSeekingState] = useState<SubtitleSeekingState>({
-    capability: null,
-    status: '',
-    isLoading: false,
-  });
 
-  const savePosition = useCallback(async (reason: SaveReason = 'passive') => {
+  useEffect(() => {
+    videoRef.current = externalVideoElement;
+  }, [externalVideoElement]);
+
+  const savePositionForVideo = useCallback(async (
+    video: HTMLVideoElement | null,
+    reason: SaveReason = 'passive',
+  ) => {
     const currentEntry = entryRef.current;
     const currentPlaybackTarget = playbackTargetRef.current;
-    if (!currentEntry || !currentPlaybackTarget || !videoRef.current) return;
-    const video = videoRef.current;
+    if (!currentEntry || !currentPlaybackTarget || !video) return;
     const currentTime = video.currentTime;
     const duration = video.duration;
 
@@ -194,6 +167,21 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
       lastPlayedAt: Date.now(),
     });
     playbackRef.current = nextPlayback;
+  }, []);
+
+  const savePosition = useCallback(
+    async (reason: SaveReason = 'passive') => {
+      await savePositionForVideo(videoRef.current, reason);
+    },
+    [savePositionForVideo],
+  );
+
+  const rememberSessionResumePosition = useCallback((video: HTMLVideoElement, key: string | null) => {
+    if (!key || !Number.isFinite(video.currentTime) || video.currentTime <= 0) return;
+    sessionResumeRef.current = {
+      sourceKey: key,
+      positionSec: video.currentTime,
+    };
   }, []);
 
   const copyDiagnostics = useCallback(async () => {
@@ -247,9 +235,10 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
   }, [phase, status, subtitleStatus]);
 
   useEffect(() => {
-    if (!source || !videoRef.current) return;
+    const video = externalVideoElement ?? videoRef.current;
+    if (!source || !video) return;
 
-    const video = videoRef.current;
+    videoRef.current = video;
     video.currentTime = 0;
     const engine = new PlaysVideoEngine(video, {
       embeddedSubtitlePolicy,
@@ -261,11 +250,9 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     segmentStatesRef.current = null;
     readyDetailRef.current = null;
     setDiagnosticsStatus('');
-    setSubtitleSeekingState({ capability: null, status: '', isLoading: false });
 
     const label = entry ? `${entry.name} (${entry.path})` : file!.name;
     pushDiagnosticEvent(diagnosticsRef, 'session:start', label);
-    setAv1WarningMessage('');
 
     engine.addEventListener('loading', ((e: CustomEvent) => {
       setStatus(`Opening ${e.detail.file?.name ?? ''}...`);
@@ -281,7 +268,7 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
 
     engine.addEventListener('ready', ((e: CustomEvent) => {
       const mode = e.detail.passthrough ? 'direct playback' : `${e.detail.totalSegments} segments`;
-      setStatus(`Ready — ${mode}`);
+      setStatus(`Ready \u2014 ${mode}`);
       setPhase('ready');
       setHasEnded(false);
       readyDetailRef.current = e.detail;
@@ -291,7 +278,16 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
         `${mode}; duration=${Number(e.detail.durationSec).toFixed(3)}`,
       );
 
-      if (entry) {
+      const sessionResume = sessionResumeRef.current;
+      if (sessionResume?.sourceKey === sourceKey && sessionResume.positionSec > 0) {
+        video.currentTime = sessionResume.positionSec;
+        sessionResumeRef.current = null;
+        pushDiagnosticEvent(
+          diagnosticsRef,
+          'video:restore-position',
+          `currentTime=${sessionResume.positionSec.toFixed(3)}`,
+        );
+      } else if (entry) {
         const resumePlayback = playbackRef.current;
         if (resumePlayback?.positionSec > 0 && resumePlayback.watchState === 'in-progress') {
           video.currentTime = resumePlayback.positionSec;
@@ -302,38 +298,6 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
           );
         }
       }
-
-      // Phase 2a: Detect subtitle seeking capability when engine is ready
-      (async () => {
-        try {
-          const metadata = await engine.getSubtitleSeekingMetadata(0);
-          if (metadata) {
-            setSubtitleSeekingState({
-              capability: {
-                trackIndex: 0,
-                hasCuesIndex: metadata.hasCuesIndex,
-                cueCount: metadata.cueCount,
-                estimatedLatencyMs: metadata.estimatedLatencyMs,
-              },
-              status: `Subtitle seeking ready (${metadata.cueCount} cues)`,
-              isLoading: false,
-            });
-            pushDiagnosticEvent(
-              diagnosticsRef,
-              'subtitle:seeking-capability',
-              `hasCuesIndex=${metadata.hasCuesIndex} cueCount=${metadata.cueCount}`,
-            );
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          setSubtitleSeekingState((prev) => ({
-            ...prev,
-            status: `Seeking capability check failed: ${message}`,
-            isLoading: false,
-          }));
-          pushDiagnosticEvent(diagnosticsRef, 'subtitle:seeking-error', message);
-        }
-      })();
     }) as EventListener);
 
     engine.addEventListener('subtitle-status', ((e: CustomEvent) => {
@@ -361,18 +325,6 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
           })),
         }),
       );
-
-      // Extract AV1 warning from diagnostics
-      const av1Diagnostics = e.detail.evaluation?.evaluations
-        ?.flatMap((eval: any) => eval.diagnostics ?? [])
-        .filter((diag: any) => diag.code?.startsWith('hls-av1-')) ?? [];
-      
-      if (av1Diagnostics.length > 0) {
-        const av1Diag = av1Diagnostics[0];
-        setAv1WarningMessage(av1Diag.message ?? '');
-      } else {
-        setAv1WarningMessage('');
-      }
     }) as EventListener);
 
     engine.addEventListener('workerstatechange', ((e: CustomEvent) => {
@@ -474,14 +426,6 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
         setStatus('Getting file access...');
         setNeedsPermission(false);
         pushDiagnosticEvent(diagnosticsRef, 'file-access:start');
-        
-        // Check if InnerTube options are available
-        if (source.kind === 'entry' && source.innerTubeOptions) {
-          pushDiagnosticEvent(diagnosticsRef, 'innertube:load-start');
-          engine.loadWithOptions({ source: source.innerTubeOptions.source, options: source.innerTubeOptions.options });
-          return;
-        }
-        
         const resolved = await getFile(entry!, { requestPermission: false });
         pushDiagnosticEvent(
           diagnosticsRef,
@@ -508,8 +452,9 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     })();
 
     return () => {
+      rememberSessionResumePosition(video, sourceKey);
       if (entry) {
-        savePosition().then(() => scheduleSyncIfLoggedIn());
+        savePositionForVideo(video).then(() => scheduleSyncIfLoggedIn());
       }
       if (interval) clearInterval(interval);
       video.removeEventListener('playing', onPlaying);
@@ -524,7 +469,16 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
       engine.destroy();
       engineRef.current = null;
     };
-  }, [embeddedSubtitlePolicy, sourceKey, retryCounter]);
+  }, [
+    embeddedSubtitlePolicy,
+    sourceKey,
+    retryCounter,
+    reloadKey,
+    externalVideoElement,
+    rememberSessionResumePosition,
+    savePosition,
+    savePositionForVideo,
+  ]);
 
   const retryPermission = useCallback(async () => {
     if (!folderProvider.requiresPermissionGrant) {
@@ -578,63 +532,6 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     setSubtitleStatus('');
   }, []);
 
-  // Phase 2a: Subtitle seeking callback
-  const seekSubtitle = useCallback(async (trackIndex: number, targetTimeSec: number) => {
-    const engine = engineRef.current;
-    if (!engine) {
-      const error = 'Player is not ready';
-      setSubtitleSeekingState((prev) => ({
-        ...prev,
-        status: `Seeking error: ${error}`,
-      }));
-      throw new Error(error);
-    }
-
-    setSubtitleSeekingState((prev) => ({
-      ...prev,
-      isLoading: true,
-      status: `Seeking to ${formatTime(targetTimeSec)}...`,
-    }));
-
-    try {
-      const startMs = performance.now();
-      const result = await engine.seekSubtitle({
-        targetTimeSec,
-        trackIndex,
-      });
-      const elapsedMs = performance.now() - startMs;
-
-      if (result) {
-        setSubtitleSeekingState((prev) => ({
-          ...prev,
-          isLoading: false,
-          status: `Found ${result.cues.length} cues (${elapsedMs.toFixed(0)}ms)`,
-        }));
-        pushDiagnosticEvent(
-          diagnosticsRef,
-          'subtitle:seek-success',
-          `targetTime=${targetTimeSec} cuesFound=${result.cues.length} elapsedMs=${elapsedMs.toFixed(0)}`,
-        );
-      } else {
-        setSubtitleSeekingState((prev) => ({
-          ...prev,
-          isLoading: false,
-          status: 'No cues found at target time',
-        }));
-        pushDiagnosticEvent(diagnosticsRef, 'subtitle:seek-no-cues', `targetTime=${targetTimeSec}`);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setSubtitleSeekingState((prev) => ({
-        ...prev,
-        isLoading: false,
-        status: `Seeking error: ${message}`,
-      }));
-      pushDiagnosticEvent(diagnosticsRef, 'subtitle:seek-error', message);
-      throw err;
-    }
-  }, []);
-
   return {
     videoRef,
     status,
@@ -648,10 +545,5 @@ export function useEngine(source: EngineSource | null): UseEngineResult {
     copyDiagnostics,
     diagnosticsStatus,
     savePosition,
-    // Phase 2a: Subtitle seeking capability
-    subtitleSeekingCapability: subtitleSeekingState.capability,
-    seekSubtitle,
-    subtitleSeekingStatus: subtitleSeekingState.status,
-    av1WarningMessage,
   };
 }

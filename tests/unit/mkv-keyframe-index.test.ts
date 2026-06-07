@@ -8,6 +8,7 @@ import {
 } from '../../src/pipeline/mkv-keyframe-index.js';
 
 const EBML_ID = 0x1a45dfa3;
+const VOID_ID = 0xec;
 const SEGMENT_ID = 0x18538067;
 const SEEKHEAD_ID = 0x114d9b74;
 const SEEK_ID = 0x4dbb;
@@ -17,15 +18,18 @@ const INFO_ID = 0x1549a966;
 const TIMESTAMP_SCALE_ID = 0x2ad7b1;
 const DURATION_ID = 0x4489;
 const TRACKS_ID = 0x1654ae6b;
-const TRACKENTRY_ID = 0xae;
-const TRACKNUMBER_ID = 0xd7;
-const TRACKTYPE_ID = 0x83;
+const TRACK_ENTRY_ID = 0xae;
+const TRACK_NUMBER_ID = 0xd7;
+const TRACK_TYPE_ID = 0x83;
+const FLAG_ENABLED_ID = 0xb9;
+const FLAG_DEFAULT_ID = 0x88;
 const CUES_ID = 0x1c53bb6b;
 const CUEPOINT_ID = 0xbb;
 const CUETIME_ID = 0xb3;
 const CUETRACKPOSITIONS_ID = 0xb7;
 const CUETRACK_ID = 0xf7;
 const CUECLUSTERPOSITION_ID = 0xf1;
+const CLUSTER_ID = 0x1f43b675;
 
 function writeElementId(id: number): Uint8Array {
   if (id < 0x100) return new Uint8Array([id]);
@@ -66,6 +70,15 @@ function ebmlElement(id: number, data: Uint8Array): Uint8Array {
   return result;
 }
 
+function ebmlUnknownSizeElement(id: number, data: Uint8Array): Uint8Array {
+  const idBytes = writeElementId(id);
+  const result = new Uint8Array(idBytes.length + 1 + data.length);
+  result.set(idBytes, 0);
+  result[idBytes.length] = 0xff;
+  result.set(data, idBytes.length + 1);
+  return result;
+}
+
 function ebmlUintElement(id: number, value: number, width?: number): Uint8Array {
   const w = width ?? (value < 0x100 ? 1 : value < 0x10000 ? 2 : value < 0x1000000 ? 3 : 4);
   return ebmlElement(id, writeUint(value, w));
@@ -89,9 +102,20 @@ function concat(...arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
+interface BuildMkvBufferOptions {
+  segmentPaddingBytes?: number;
+  topLevelPaddingBytes?: number;
+  clusterBeforeCuesBytes?: number;
+  unknownSizeCues?: boolean;
+}
+
 function buildMkvBuffer(
   cues: Array<{ cueTime: number; track: number; clusterOffset: number }>,
   timestampScale = 1_000_000,
+  tracks: Array<{ number: number; type: number; enabled?: boolean; default?: boolean }> = [
+    { number: 1, type: 1 },
+  ],
+  options: BuildMkvBufferOptions = {},
 ): Uint8Array {
   const docType = new TextEncoder().encode('matroska');
   const ebmlHeader = ebmlElement(
@@ -107,20 +131,28 @@ function buildMkvBuffer(
       ebmlFloat64Element(DURATION_ID, durationTicks),
     ),
   );
-
-  const tracksElement = ebmlElement(
-    TRACKS_ID,
-    concat(
-      ebmlElement(
-        TRACKENTRY_ID,
-        concat(ebmlUintElement(TRACKNUMBER_ID, 1), ebmlUintElement(TRACKTYPE_ID, 1)),
-      ),
-      ebmlElement(
-        TRACKENTRY_ID,
-        concat(ebmlUintElement(TRACKNUMBER_ID, 2), ebmlUintElement(TRACKTYPE_ID, 2)),
-      ),
-    ),
-  );
+  const tracksElement = tracks
+    ? ebmlElement(
+        TRACKS_ID,
+        concat(
+          ...tracks.map((track) =>
+            ebmlElement(
+              TRACK_ENTRY_ID,
+              concat(
+                ebmlUintElement(TRACK_NUMBER_ID, track.number),
+                ebmlUintElement(TRACK_TYPE_ID, track.type),
+                track.enabled === undefined
+                  ? new Uint8Array()
+                  : ebmlUintElement(FLAG_ENABLED_ID, Number(track.enabled)),
+                track.default === undefined
+                  ? new Uint8Array()
+                  : ebmlUintElement(FLAG_DEFAULT_ID, Number(track.default)),
+              ),
+            ),
+          ),
+        ),
+      )
+    : new Uint8Array();
 
   const cuePointElements = cues.map((cue) =>
     ebmlElement(
@@ -137,7 +169,20 @@ function buildMkvBuffer(
       ),
     ),
   );
-  const cuesElement = ebmlElement(CUES_ID, concat(...cuePointElements));
+  const cuesPayload = concat(...cuePointElements);
+  const cuesElement = options.unknownSizeCues
+    ? ebmlUnknownSizeElement(CUES_ID, cuesPayload)
+    : ebmlElement(CUES_ID, cuesPayload);
+
+  const segmentPadding = options.segmentPaddingBytes
+    ? ebmlElement(VOID_ID, new Uint8Array(options.segmentPaddingBytes))
+    : new Uint8Array();
+  const topLevelPadding = options.topLevelPaddingBytes
+    ? ebmlElement(VOID_ID, new Uint8Array(options.topLevelPaddingBytes))
+    : new Uint8Array();
+  const clusterBeforeCues = options.clusterBeforeCuesBytes
+    ? ebmlElement(CLUSTER_ID, new Uint8Array(options.clusterBeforeCuesBytes))
+    : new Uint8Array();
 
   function buildSeekHead(infoPos: number, tracksPos: number, cuesPos: number): Uint8Array {
     const seekInfo = ebmlElement(
@@ -165,19 +210,35 @@ function buildMkvBuffer(
   }
 
   const seekHeadEstimate = buildSeekHead(0, 0, 0);
-  const infoRelOffset = seekHeadEstimate.length;
+  const infoRelOffset = segmentPadding.length + seekHeadEstimate.length;
   const tracksRelOffset = infoRelOffset + infoElement.length;
-  const cuesRelOffset = tracksRelOffset + tracksElement.length;
+  const cuesRelOffset = tracksRelOffset + tracksElement.length + clusterBeforeCues.length;
   const seekHead = buildSeekHead(infoRelOffset, tracksRelOffset, cuesRelOffset);
 
   return concat(
     ebmlHeader,
-    ebmlElement(SEGMENT_ID, concat(seekHead, infoElement, tracksElement, cuesElement)),
+    topLevelPadding,
+    ebmlElement(
+      SEGMENT_ID,
+      concat(segmentPadding, seekHead, infoElement, tracksElement, clusterBeforeCues, cuesElement),
+    ),
   );
 }
 
 function bufferRead(buffer: Uint8Array) {
   return (start: number, end: number) => buffer.subarray(start, end);
+}
+
+function trackingRead(buffer: Uint8Array) {
+  const reads: Array<{ start: number; end: number }> = [];
+  return {
+    read: (start: number, end: number) => {
+      reads.push({ start, end });
+      return buffer.subarray(start, end);
+    },
+    reads,
+    totalBytesRead: () => reads.reduce((sum, read) => sum + read.end - read.start, 0),
+  };
 }
 
 describe('mkv-keyframe-index', () => {
@@ -192,22 +253,6 @@ describe('mkv-keyframe-index', () => {
 
     expect(cues).toHaveLength(3);
     expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 1000, 2000]);
-  });
-
-  it('filters cues to the primary video track', async () => {
-    const mkv = buildMkvBuffer([
-      { cueTime: 0, track: 1, clusterOffset: 1000 },
-      { cueTime: 500, track: 2, clusterOffset: 25_000 },
-      { cueTime: 1000, track: 1, clusterOffset: 50_000 },
-      { cueTime: 1500, track: 2, clusterOffset: 75_000 },
-      { cueTime: 2000, track: 1, clusterOffset: 100_000 },
-    ]);
-
-    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
-    const index = await buildMkvKeyframeIndexFromBlob(new Blob([mkv]));
-
-    expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 1000, 2000]);
-    expect(index?.keyframes.map((entry) => entry.timestamp)).toEqual([0, 1, 2]);
   });
 
   it('builds a keyframe index from a Blob', async () => {
@@ -227,6 +272,147 @@ describe('mkv-keyframe-index', () => {
         { timestamp: 2, sequenceNumber: 2 },
       ],
     });
+  });
+
+  it('filters cue points to the video track when track metadata is available', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 500, track: 2, clusterOffset: 20_000 },
+        { cueTime: 1000, track: 2, clusterOffset: 50_000 },
+        { cueTime: 2000, track: 1, clusterOffset: 100_000 },
+      ],
+      1_000_000,
+      [
+        { number: 1, type: 1 },
+        { number: 2, type: 2 },
+      ],
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 2000]);
+  });
+
+  it('does not trust cues when no video track can be identified', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 2, clusterOffset: 1000 },
+        { cueTime: 1000, track: 2, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [{ number: 2, type: 2 }],
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues).toEqual([]);
+  });
+
+  it('uses the default video track when multiple video tracks are present', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 2, clusterOffset: 50_000 },
+        { cueTime: 2000, track: 1, clusterOffset: 100_000 },
+        { cueTime: 3000, track: 2, clusterOffset: 150_000 },
+      ],
+      1_000_000,
+      [
+        { number: 1, type: 1, default: false },
+        { number: 2, type: 1, default: true },
+      ],
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([1000, 3000]);
+  });
+
+  it('skips disabled video tracks when matching cues', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 2, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [
+        { number: 1, type: 1, enabled: false },
+        { number: 2, type: 1 },
+      ],
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([1000]);
+  });
+
+  it('scans sparse segment metadata past large front padding', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 1, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [{ number: 1, type: 1 }],
+      { segmentPaddingBytes: 8192 },
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 1000]);
+  });
+
+  it('skips top-level padding before the Segment element', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 1, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [{ number: 1, type: 1 }],
+      { topLevelPaddingBytes: 4096 },
+    );
+
+    const cues = await parseMkvCues(bufferRead(mkv), mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 1000]);
+  });
+
+  it('uses SeekHead offsets without reading cluster payloads', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 1, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [{ number: 1, type: 1 }],
+      { clusterBeforeCuesBytes: 20_000 },
+    );
+    const { read, totalBytesRead } = trackingRead(mkv);
+
+    const cues = await parseMkvCues(read, mkv.length);
+
+    expect(cues.map((cue) => cue.timestampMs)).toEqual([0, 1000]);
+    expect(totalBytesRead()).toBeLessThan(2000);
+  });
+
+  it('does not read the rest of the file when Cues has unknown size', async () => {
+    const mkv = buildMkvBuffer(
+      [
+        { cueTime: 0, track: 1, clusterOffset: 1000 },
+        { cueTime: 1000, track: 1, clusterOffset: 50_000 },
+      ],
+      1_000_000,
+      [{ number: 1, type: 1 }],
+      { unknownSizeCues: true, clusterBeforeCuesBytes: 20_000 },
+    );
+    const { read, totalBytesRead } = trackingRead(mkv);
+
+    const cues = await parseMkvCues(read, mkv.length);
+
+    expect(cues).toEqual([]);
+    expect(totalBytesRead()).toBeLessThan(2000);
   });
 
   it('builds a keyframe index from a StreamSource', async () => {

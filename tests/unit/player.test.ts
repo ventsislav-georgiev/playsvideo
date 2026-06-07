@@ -2,7 +2,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CatalogEntry } from '../../app/src/db.js';
+import type { CatalogEntry, PlaybackEntry } from '../../app/src/db.js';
 import { Player } from '../../app/src/pages/Player.js';
 
 const { useLiveQueryMock, useEngineMock, useSettingMock, listSiblingSubtitleFilesMock } =
@@ -25,8 +25,8 @@ vi.mock('../../app/src/hooks/useSetting.js', () => ({
   useSetting: useSettingMock,
 }));
 
-vi.mock('../../app/src/hooks/useCustomControls.js', () => ({
-  useCustomControls: vi.fn(),
+vi.mock('../../app/src/hooks/useVideoJsControls.js', () => ({
+  useVideoJsControls: vi.fn(),
 }));
 
 vi.mock('../../app/src/hooks/useFullscreen.js', () => ({
@@ -60,6 +60,19 @@ function makeCatalogEntry(overrides: Partial<CatalogEntry> = {}): CatalogEntry {
   };
 }
 
+function makePlaybackEntry(overrides: Partial<PlaybackEntry> = {}): PlaybackEntry {
+  return {
+    deviceId: 'device-1',
+    playbackKey: 'file:Episode.mkv|1000',
+    positionSec: 152,
+    durationSec: 3600,
+    watchState: 'in-progress',
+    lastPlayedAt: 100,
+    updatedAt: 100,
+    ...overrides,
+  };
+}
+
 describe('Player', () => {
   beforeEach(() => {
     useLiveQueryMock.mockReset();
@@ -78,6 +91,7 @@ describe('Player', () => {
       clearExternalSubtitles: vi.fn(),
       copyDiagnostics: vi.fn(),
       diagnosticsStatus: '',
+      savePosition: vi.fn(),
     });
   });
 
@@ -106,16 +120,20 @@ describe('Player', () => {
     );
 
     expect(html).not.toContain('Loading...');
-    expect(html).toContain('<video');
-    expect(useEngineMock).toHaveBeenCalledWith({
-      kind: 'entry',
-      entry,
-      playback: null,
-      playbackTarget: {
-        deviceId: 'device-1',
-        playbackKey: 'file:Episode.mkv|1000',
+    expect(html).toContain('pv-video-host');
+    expect(useEngineMock).toHaveBeenCalledWith(
+      {
+        kind: 'entry',
+        entry,
+        playback: null,
+        playbackTarget: {
+          deviceId: 'device-1',
+          playbackKey: 'file:Episode.mkv|1000',
+        },
       },
-    });
+      'stock',
+      null,
+    );
   });
 
   it('renders not found instead of staying on loading when the catalog row is missing', async () => {
@@ -142,17 +160,17 @@ describe('Player', () => {
 
     expect(html).not.toContain('Loading...');
     expect(html).toContain('Video not found.');
-    expect(useEngineMock).toHaveBeenCalledWith(null);
+    expect(useEngineMock).toHaveBeenCalledWith(null, 'stock', null);
   });
 
-  it('renders the player while device id is still pending', async () => {
+  it('waits for playback lookup before starting the player', async () => {
     const entry = makeCatalogEntry();
 
     useLiveQueryMock
       .mockReturnValueOnce(entry)
       .mockReturnValueOnce([entry])
-      .mockReturnValueOnce(undefined)
-      .mockReturnValueOnce(null);
+      .mockImplementationOnce((_: unknown, __: unknown, defaultResult: unknown) => defaultResult)
+      .mockImplementationOnce((_: unknown, __: unknown, defaultResult: unknown) => defaultResult);
 
     const html = renderToStaticMarkup(
       createElement(
@@ -169,13 +187,76 @@ describe('Player', () => {
       ),
     );
 
-    expect(html).not.toContain('Loading...');
-    expect(html).toContain('<video');
-    expect(useEngineMock).toHaveBeenCalledWith({
-      kind: 'entry',
-      entry,
-      playback: null,
-      playbackTarget: null,
+    expect(html).toContain('Loading...');
+    expect(useEngineMock).toHaveBeenCalledWith(null, 'stock', null);
+  });
+
+  it('uses route resume playback when no local playback exists', async () => {
+    const entry = makeCatalogEntry();
+    const resumePlayback = makePlaybackEntry({
+      deviceId: 'remote-device',
+      positionSec: 152,
+      lastPlayedAt: 500,
+      updatedAt: 500,
     });
+
+    useLiveQueryMock
+      .mockReturnValueOnce(entry)
+      .mockReturnValueOnce([entry])
+      .mockReturnValueOnce('device-1')
+      .mockReturnValueOnce(null);
+
+    const html = renderToStaticMarkup(
+      createElement(
+        MemoryRouter,
+        {
+          initialEntries: [
+            {
+              pathname: '/play/1',
+              state: {
+                resumePlayback: {
+                  playbackKey: resumePlayback.playbackKey,
+                  positionSec: resumePlayback.positionSec,
+                  durationSec: resumePlayback.durationSec,
+                  watchState: resumePlayback.watchState,
+                  lastPlayedAt: resumePlayback.lastPlayedAt,
+                },
+              },
+            },
+          ],
+        },
+        createElement(
+          Routes,
+          null,
+          createElement(Route, {
+            path: '/play/:id',
+            element: createElement(Player),
+          }),
+        ),
+      ),
+    );
+
+    expect(html).not.toContain('Loading...');
+    expect(useEngineMock).toHaveBeenCalledWith(
+      {
+        kind: 'entry',
+        entry,
+        playback: {
+          deviceId: 'device-1',
+          playbackKey: 'file:Episode.mkv|1000',
+          positionSec: 152,
+          durationSec: 3600,
+          watchState: 'in-progress',
+          lastPlayedAt: 500,
+          updatedAt: 500,
+        },
+        playbackTarget: {
+          deviceId: 'device-1',
+          playbackKey: 'file:Episode.mkv|1000',
+        },
+      },
+      'stock',
+      null,
+    );
   });
 });

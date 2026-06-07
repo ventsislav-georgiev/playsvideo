@@ -1,17 +1,75 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { db, type CatalogEntry } from '../db';
+import { db, type CatalogEntry, type PlaybackEntry } from '../db';
 import { getDeviceId } from '../device.js';
 import { useEngine } from '../hooks/useEngine';
+import { usePlaybackVideoElement } from '../hooks/usePlaybackVideoElement.js';
 import { folderProvider, type SiblingSubtitleFile } from '../folder-provider.js';
 import { useSetting } from '../hooks/useSetting';
-import { useCustomControls } from '../hooks/useCustomControls';
 import { useFullscreen } from '../hooks/useFullscreen';
+import { useVideoJsControls } from '../hooks/useVideoJsControls.js';
 import { getLocalPlayback } from '../local-playback.js';
-import { AUTOPLAY_NEXT_EPISODE_KEY, PLAYER_CONTROLS_TYPE_KEY } from '../settings.js';
+import {
+  AUTOPLAY_NEXT_EPISODE_KEY,
+  normalizePlayerControlsType,
+  PLAYER_CONTROLS_TYPE_KEY,
+  type PlayerControlsType,
+} from '../settings.js';
 
 const PLAYER_QUERY_PENDING = Symbol('player-query-pending');
+
+type RouteResumePlayback = Pick<
+  PlaybackEntry,
+  'playbackKey' | 'positionSec' | 'durationSec' | 'watchState' | 'lastPlayedAt'
+>;
+
+interface PlayerRouteState {
+  entry?: CatalogEntry | null;
+  resumePlayback?: RouteResumePlayback | null;
+}
+
+function isPlayerRouteState(value: unknown): value is PlayerRouteState {
+  return value != null && typeof value === 'object';
+}
+
+function routeResumeToPlaybackEntry(input: {
+  resumePlayback: RouteResumePlayback;
+  deviceId: string | null;
+  playbackKey: string;
+}): PlaybackEntry {
+  return {
+    deviceId: input.deviceId ?? 'route-state',
+    playbackKey: input.playbackKey,
+    positionSec: input.resumePlayback.positionSec,
+    durationSec: input.resumePlayback.durationSec,
+    watchState: input.resumePlayback.watchState,
+    lastPlayedAt: input.resumePlayback.lastPlayedAt,
+    updatedAt: input.resumePlayback.lastPlayedAt,
+  };
+}
+
+function selectInitialPlayback(input: {
+  localPlayback: PlaybackEntry | null;
+  routeResumePlayback: RouteResumePlayback | null;
+  deviceId: string | null;
+  playbackKey: string | null;
+}): PlaybackEntry | null {
+  const routePlayback =
+    input.routeResumePlayback && input.playbackKey
+      ? routeResumeToPlaybackEntry({
+          resumePlayback: input.routeResumePlayback,
+          deviceId: input.deviceId,
+          playbackKey: input.playbackKey,
+        })
+      : null;
+
+  if (!input.localPlayback) return routePlayback;
+  if (!routePlayback) return input.localPlayback;
+  return routePlayback.lastPlayedAt > input.localPlayback.lastPlayedAt
+    ? routePlayback
+    : input.localPlayback;
+}
 
 function magnetWithFileIndex(entry: CatalogEntry): string {
   const url = entry.torrentMagnetUrl!;
@@ -92,17 +150,19 @@ export function Player() {
   const [siblingSubtitles, setSiblingSubtitles] = useState<SiblingSubtitleFile[]>([]);
   const [loadingSiblingSubtitles, setLoadingSiblingSubtitles] = useState(false);
   const [siblingSubtitleStatus, setSiblingSubtitleStatus] = useState('');
-  const [controlsType, setControlsType] = useSetting<'stock' | 'custom'>(
+  const [storedControlsType, setControlsType] = useSetting<PlayerControlsType | 'custom'>(
     PLAYER_CONTROLS_TYPE_KEY,
     'stock',
   );
+  const controlsType = normalizePlayerControlsType(storedControlsType);
+  const { setVideoHostElement, videoElement } = usePlaybackVideoElement(controlsType);
   const [autoplayNextEpisode] = useSetting<boolean>(AUTOPLAY_NEXT_EPISODE_KEY, false);
+  const routeState = isPlayerRouteState(location.state) ? location.state : null;
   const routeEntry =
-    location.state &&
-    typeof location.state === 'object' &&
-    'entry' in location.state &&
-    (location.state.entry as CatalogEntry | null)?.id === entryId
-      ? (location.state.entry as CatalogEntry)
+    routeState &&
+    'entry' in routeState &&
+    (routeState.entry as CatalogEntry | null)?.id === entryId
+      ? (routeState.entry as CatalogEntry)
       : null;
 
   const entry = useLiveQuery(
@@ -113,7 +173,8 @@ export function Player() {
   const entries = useLiveQuery(() => db.catalog.toArray(), [], []);
   const deviceId = useLiveQuery(() => getDeviceId(), [], PLAYER_QUERY_PENDING);
   const resolvedEntry = entry === PLAYER_QUERY_PENDING ? routeEntry : entry;
-  const resolvedDeviceId = deviceId === PLAYER_QUERY_PENDING ? null : deviceId;
+  const deviceIdPending = deviceId === PLAYER_QUERY_PENDING || deviceId === '';
+  const resolvedDeviceId = deviceIdPending ? null : deviceId;
   const playbackKey = resolvedEntry?.canonicalPlaybackKey ?? null;
   const localPlayback = useLiveQuery(
     () =>
@@ -121,10 +182,28 @@ export function Player() {
         ? getLocalPlayback(resolvedDeviceId, playbackKey)
         : Promise.resolve(null),
     [resolvedDeviceId, playbackKey],
-    null,
+    PLAYER_QUERY_PENDING,
   );
+  const routeResumePlayback =
+    routeState?.resumePlayback?.playbackKey === playbackKey ? routeState.resumePlayback : null;
+  const playbackLookupPending =
+    Boolean(resolvedEntry && resolvedEntry.hasLocalFile !== false && playbackKey) &&
+    (deviceIdPending || localPlayback === PLAYER_QUERY_PENDING);
+  const selectedPlayback =
+    localPlayback === PLAYER_QUERY_PENDING
+      ? selectInitialPlayback({
+          localPlayback: null,
+          routeResumePlayback,
+          deviceId: resolvedDeviceId,
+          playbackKey,
+        })
+      : selectInitialPlayback({
+          localPlayback: localPlayback ?? null,
+          routeResumePlayback,
+          deviceId: resolvedDeviceId,
+          playbackKey,
+        });
   const {
-    videoRef,
     status,
     phase,
     hasEnded,
@@ -135,40 +214,27 @@ export function Player() {
     clearExternalSubtitles,
     copyDiagnostics,
     diagnosticsStatus,
-    av1WarningMessage,
     savePosition,
-    seekSubtitle,
-    subtitleSeekingCapability,
-    subtitleSeekingStatus,
-  } =
-    useEngine(
-      resolvedEntry &&
-        resolvedEntry.hasLocalFile !== false
-        ? {
-            kind: 'entry',
-            entry: resolvedEntry,
-            playback: localPlayback ?? null,
-            playbackTarget:
-              resolvedDeviceId && playbackKey
-                ? {
-                    deviceId: resolvedDeviceId,
-                    playbackKey,
-                  }
-                : null,
-            innerTubeOptions: undefined,
-          }
-        : null,
-    );
-  useCustomControls({
-    videoRef,
-    container: containerEl,
-    enabled: controlsType === 'custom',
-    // Phase 2c: Wire subtitle seeking
-    onSubtitleSeek: seekSubtitle,
-    subtitleSeekingCapability,
-    subtitleSeekingStatus,
-  });
-  useFullscreen(videoRef, containerEl);
+  } = useEngine(
+    resolvedEntry && resolvedEntry.hasLocalFile !== false && !playbackLookupPending
+      ? {
+          kind: 'entry',
+          entry: resolvedEntry,
+          playback: selectedPlayback,
+          playbackTarget:
+            resolvedDeviceId && playbackKey
+              ? {
+                  deviceId: resolvedDeviceId,
+                  playbackKey,
+                }
+              : null,
+        }
+      : null,
+    controlsType,
+    videoElement,
+  );
+  useVideoJsControls(videoElement, controlsType);
+  useFullscreen(videoElement, containerEl);
 
   const { previousEpisode, nextEpisode } = useMemo(() => {
     if (!resolvedEntry || entries === undefined) {
@@ -255,7 +321,7 @@ export function Player() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedEntry, siblingSubtitleKey, phase]);
 
-  if (entry === PLAYER_QUERY_PENDING && !routeEntry) {
+  if ((entry === PLAYER_QUERY_PENDING && !routeEntry) || playbackLookupPending) {
     return <div className="player-page">Loading...</div>;
   }
 
@@ -299,8 +365,9 @@ export function Player() {
             {previousEpisode ? (
               <Link to={`/play/${previousEpisode.id}`} state={{ entry: previousEpisode }} className="btn btn-secondary">
                 &larr; Previous
-              </Link>      ) : null}
-      {nextEpisode ? (
+              </Link>
+            ) : null}
+            {nextEpisode ? (
               <button
                 type="button"
                 className="player-episode-nav-link"
@@ -339,15 +406,12 @@ export function Player() {
           } catch {}
         }}
       />
-      <div className="pv-video-container" ref={setContainerEl}>
-        <video ref={videoRef} controls={controlsType === 'stock'} autoPlay />
+      <div
+        className={`pv-video-container${controlsType === 'videojs' ? ' pv-videojs-container' : ''}`}
+        ref={setContainerEl}
+      >
+        <div className="pv-video-host" ref={setVideoHostElement} />
       </div>
-      {av1WarningMessage ? (
-        <div className="player-av1-warning">
-          <div className="player-av1-warning-icon">⚠️</div>
-          <div className="player-av1-warning-text">{av1WarningMessage}</div>
-        </div>
-      ) : null}
       {needsPermission && (
         <button className="btn btn-primary player-permission-btn" onClick={retryPermission}>
           {folderProvider.requiresPermissionGrant
@@ -382,9 +446,9 @@ export function Player() {
       <div className="player-actions">
         <button
           className="btn btn-secondary"
-          onClick={() => setControlsType(controlsType === 'stock' ? 'custom' : 'stock')}
+          onClick={() => setControlsType(controlsType === 'stock' ? 'videojs' : 'stock')}
         >
-          {controlsType === 'stock' ? 'Custom controls' : 'Stock controls'}
+          {controlsType === 'stock' ? 'Video.js controls' : 'Stock controls'}
         </button>
         <button
           className="btn btn-secondary"

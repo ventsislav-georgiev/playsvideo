@@ -51,7 +51,11 @@ describe('mkv metadata io', () => {
         stdio: 'pipe',
       });
     }
-    buffer = readFileSync(MKV_FIXTURE);
+    // readFileSync returns a Node Buffer whose prototype chain is Node's
+    // Uint8Array. Under the jsdom test environment mediabunny's `instanceof
+    // Uint8Array` check (in CustomSource._runWorker) uses jsdom's realm, so a
+    // raw Buffer fails the check. Copy into a realm-native Uint8Array.
+    buffer = new Uint8Array(readFileSync(MKV_FIXTURE));
     fileSize = buffer.byteLength;
   });
 
