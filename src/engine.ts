@@ -2942,9 +2942,24 @@ export class PlaysVideoEngine extends EventTarget {
     const currentTime = this.video.currentTime;
     const SUBTITLE_WINDOW_SEC = 600;
     const PREFETCH_AHEAD_SEC = 120;
+    const PREFETCH_STALL_MS = 20000;
 
     for (const [trackIndex, windowEnd] of this.subtitleWindowEnd) {
-      if (this.subtitleWindowLoading.has(trackIndex)) continue;
+      if (this.subtitleWindowLoading.has(trackIndex)) {
+        const startedAt = this.subtitleRequestTimes.get(trackIndex) ?? 0;
+        if (!startedAt || Date.now() - startedAt < PREFETCH_STALL_MS) continue;
+        // In-flight prefetch never completed (lost/errored worker batch, or a
+        // superseded stale requestId). Without this recovery the loading flag
+        // stays set forever and cues stop rendering at the window end until the
+        // user stops+plays. Clear it so we re-request below (a fresh requestId
+        // stales any late batch from the lost request).
+        mlog(
+          `subtitle prefetch track=${trackIndex} stalled ${Date.now() - startedAt}ms — recovering`,
+        );
+        this.subtitleWindowLoading.delete(trackIndex);
+        this.subtitleRequestedWindowEnd.delete(trackIndex);
+        this.subtitleRequestTimes.delete(trackIndex);
+      }
       if (currentTime + PREFETCH_AHEAD_SEC < windowEnd) continue;
 
       const info = this._subtitleTracks.find((t) => t.index === trackIndex);
