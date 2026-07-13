@@ -1169,9 +1169,19 @@ async function handleSubtitle(
 
   const t0 = performance.now();
   let hasSentStart = false;
+  let firstBatchLogged = false;
+  wlog(
+    `subtitle track=${trackIndex} extraction start queueDelayMs=${Math.round(queueDelayMs)} seekFrom=${seekTimeSec ?? 0} endAt=${endTimeSec ?? 'end'}`,
+  );
+  const tInput = performance.now();
   const subInput = await ensureSubtitleInput();
+  wlog(`subtitle track=${trackIndex} input ready ${elapsed(tInput)}`);
   const { codec } = await extractSubtitleDataStreaming(subInput, trackIndex, {
     onBatch(cues, done, totalCues, batchCodec, meta) {
+      if (!firstBatchLogged) {
+        firstBatchLogged = true;
+        wlog(`subtitle track=${trackIndex} first batch cues=${cues.length} ${elapsed(t0)} (since extraction start)`);
+      }
       const message: WorkerSubtitleBatchMessage = {
         type: 'subtitle-batch',
         trackIndex,

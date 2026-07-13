@@ -2740,6 +2740,12 @@ export class PlaysVideoEngine extends EventTarget {
       return;
     }
 
+    const requestedAtMs = this.subtitleRequestTimes.get(msg.trackIndex);
+    const latencyMs = requestedAtMs ? Date.now() - requestedAtMs : -1;
+    mlog(
+      `subtitle batch track=${msg.trackIndex} cues=${msg.cues.length} done=${!!msg.done} latencyMs=${latencyMs} (since extraction request)`,
+    );
+
     let attached = this.attachedSubtitleTracks.find(
       (a) => a.source === 'embedded' && a.trackIndex === msg.trackIndex,
     );
@@ -2830,7 +2836,7 @@ export class PlaysVideoEngine extends EventTarget {
         `Subtitle track ${msg.trackIndex}: ${lang} ${msg.codec} ${msg.totalCues} cues (streamed)`,
       );
       mlog(
-        `subtitle track ${msg.trackIndex} complete: ${msg.totalCues} cues reason=${msg.stopReason ?? 'unknown'} windowComplete=${msg.windowComplete !== false}`,
+        `subtitle track ${msg.trackIndex} complete: ${msg.totalCues} cues reason=${msg.stopReason ?? 'unknown'} windowComplete=${msg.windowComplete !== false} totalMs=${latencyMs} (request→done)`,
       );
       if (msg.timedOut) {
         this.checkSubtitlePrefetch();
