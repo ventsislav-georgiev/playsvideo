@@ -48,7 +48,7 @@
   },
   "dependencies": {
     "dav1d.js": "^0.1.1",
-    "hls.js": "^1.7.0",
+    "hls.js": "1.7.0-alpha.1.0.canary.11793",
     "mediabunny": "https://github.com/ventsislav-georgiev/mediabunny/releases/download/v1.46.0-fork.1/mediabunny-1.46.0.tgz"
   },
   "devDependencies": {

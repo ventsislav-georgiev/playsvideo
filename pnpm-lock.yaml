@@ -12,8 +12,8 @@ importers:
         specifier: ^0.1.1
         version: 0.1.1
       hls.js:
-        specifier: ^1.7.0
-        version: 1.7.3
+        specifier: 1.7.0-alpha.1.0.canary.11793
+        version: 1.7.0-alpha.1.0.canary.11793
       mediabunny:
         specifier: https://github.com/ventsislav-georgiev/mediabunny/releases/download/v1.46.0-fork.1/mediabunny-1.46.0.tgz
         version: https://github.com/ventsislav-georgiev/mediabunny/releases/download/v1.46.0-fork.1/mediabunny-1.46.0.tgz
@@ -2331,8 +2331,8 @@ packages:
   highlight.js@10.7.3:
     resolution: {integrity: sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==}
 
-  hls.js@1.7.3:
-    resolution: {integrity: sha512-MsPlx6yVW4Qv4C7mEVou4/gk/5cN2dVxOTnrNjPSmyH2f0Ln+/UkG10Ax1PE6OvrmTVPKgQYozTtBaPOuCzq7A==}
+  hls.js@1.7.0-alpha.1.0.canary.11793:
+    resolution: {integrity: sha512-HrRbGOPXcKcq1MVD43dmkva5Twvh4Zkpto+JKbnGsza6nkPijzJQsnE+RxxNh0aWy3Id9rCTqN5N5jKAyRpTzQ==}
 
   hono@4.12.8:
     resolution: {integrity: sha512-VJCEvtrezO1IAR+kqEYnxUOoStaQPGrCmX3j4wDTNOcD1uRPFpGlwQUIW8niPuvHXaTUxeOUl5MMDGrl+tmO9A==}
@@ -6507,7 +6507,7 @@ snapshots:
 
   highlight.js@10.7.3: {}
 
-  hls.js@1.7.3: {}
+  hls.js@1.7.0-alpha.1.0.canary.11793: {}
 
   hono@4.12.8: {}
 
