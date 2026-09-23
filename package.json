@@ -48,8 +48,8 @@
   },
   "dependencies": {
     "dav1d.js": "^0.1.1",
-    "hls.js": "file:../hls.js",
-    "mediabunny": "file:../mediabunny"
+    "hls.js": "^1.7.0",
+    "mediabunny": "https://github.com/ventsislav-georgiev/mediabunny/releases/download/v1.46.0-fork.1/mediabunny-1.46.0.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.6",
